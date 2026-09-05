@@ -1,38 +1,47 @@
 'use client';
 
-import { useState } from 'react';
-import { useLanguage } from '@/lib/LanguageContext';
+import { useEffect, useState, useCallback, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+
+import type {
+  StudentProgress,
+  ActiveMisconception,
+  StudentTier,
+} from '@/lib/helpers';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Types
+// Props
 // ─────────────────────────────────────────────────────────────────────────────
-
-export interface MisconceptionCellData {
-  misconceptionId: string;
-  /** English name */
-  name: string;
-  /** Bahasa Melayu name */
-  name_bm: string;
-  /** Number of students currently flagged with this misconception */
-  studentCount: number;
-  /** Fraction of the class affected: 0–1 */
-  prevalence: number;
-}
-
-export interface TopicRowData {
-  topic: string;
-  topic_bm: string;
-  misconceptions: MisconceptionCellData[];
-}
 
 export interface ClassGapMapProps {
-  classSize: number;
-  rows: TopicRowData[];
-  /** Optional: highlight a specific misconception cell */
-  highlightMisconceptionId?: string;
-  /** Called when a teacher clicks a cell to drill in */
-  onCellClick?: (misconceptionId: string, topic: string) => void;
+  classId: string;
+  topics: string[];
+  language: 'en' | 'bm';
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TIER_COLORS: Record<StudentTier | 'gray', string> = {
+  red: '#ea4335',
+  yellow: '#fbbc04',
+  green: '#34a853',
+  blue: '#1a73e8',
+  gray: '#9e9e9e',
+};
+
+const TIER_TEXT_COLORS: Record<StudentTier | 'gray', string> = {
+  red: '#ffffff',
+  yellow: '#1f1f1f',
+  green: '#ffffff',
+  blue: '#ffffff',
+  gray: '#ffffff',
+};
+
+type SortMode = 'priority' | 'name';
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility
@@ -42,126 +51,567 @@ function cn(...classes: (string | false | null | undefined)[]): string {
   return classes.filter(Boolean).join(' ');
 }
 
-/** Maps a 0–1 prevalence fraction to a Tailwind heat colour. */
-function heatColour(prevalence: number): string {
-  if (prevalence === 0) return 'bg-slate-50 text-slate-300 border-slate-100';
-  if (prevalence < 0.15) return 'bg-green-50 text-green-700 border-green-200';
-  if (prevalence < 0.35) return 'bg-yellow-50 text-yellow-700 border-yellow-200';
-  if (prevalence < 0.55) return 'bg-orange-50 text-orange-700 border-orange-200';
-  return 'bg-red-50 text-red-700 border-red-200';
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// i18n copy
+// ─────────────────────────────────────────────────────────────────────────────
 
-function heatDot(prevalence: number): string {
-  if (prevalence === 0) return 'bg-slate-200';
-  if (prevalence < 0.15) return 'bg-green-400';
-  if (prevalence < 0.35) return 'bg-yellow-400';
-  if (prevalence < 0.55) return 'bg-orange-400';
-  return 'bg-red-500';
+const COPY = {
+  en: {
+    title: 'Class Gap Map',
+    subtitle: 'Evidence Layer — Real-time mastery overview',
+    priorityView: 'Priority View',
+    nameView: 'Student Name View',
+    student: 'Student',
+    noData: 'No student data yet',
+    loading: 'Loading class data…',
+    legendTitle: 'Legend',
+    legendRed: 'Prerequisite missing or persistent misconception',
+    legendYellow: 'Active misconception — developing',
+    legendGreen: 'Mastered — independent',
+    legendBlue: 'Advanced — ready for extension',
+    sheetTitle: 'Student Detail',
+    activeMisconceptions: 'Active Misconceptions',
+    noMisconceptions: 'No active misconceptions',
+    persistence: 'Persistence',
+    overrideBtn: 'Override Classification',
+    overrideConfirm: 'Override submitted',
+    close: 'Close',
+  },
+  bm: {
+    title: 'Peta Jurang Kelas',
+    subtitle: 'Lapisan Bukti — Gambaran penguasaan masa nyata',
+    priorityView: 'Paparan Keutamaan',
+    nameView: 'Paparan Nama Pelajar',
+    student: 'Pelajar',
+    noData: 'Tiada data pelajar lagi',
+    loading: 'Memuatkan data kelas…',
+    legendTitle: 'Petunjuk',
+    legendRed: 'Prasyarat tiada atau salah faham berterusan',
+    legendYellow: 'Salah faham aktif — sedang berkembang',
+    legendGreen: 'Dikuasai — berdikari',
+    legendBlue: 'Lanjutan — sedia untuk pengembangan',
+    sheetTitle: 'Butiran Pelajar',
+    activeMisconceptions: 'Salah Faham Aktif',
+    noMisconceptions: 'Tiada salah faham aktif',
+    persistence: 'Kegigihan',
+    overrideBtn: 'Gantikan Pengelasan',
+    overrideConfirm: 'Penggantian dihantar',
+    close: 'Tutup',
+  },
+} as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Urgency score — higher = needs more attention
+// ─────────────────────────────────────────────────────────────────────────────
+
+function computeUrgencyScore(progress: StudentProgress): number {
+  let score = 0;
+
+  // Tier weighting (across all topics this student has)
+  const tierWeights: Record<StudentTier, number> = {
+    red: 4,
+    yellow: 2,
+    green: 0,
+    blue: -1,
+  };
+  score += tierWeights[progress.tier] ?? 0;
+
+  // Uncleared misconception count
+  const uncleared = progress.activeMisconceptions.filter((m) => !m.isCleared);
+  score += uncleared.length * 1.5;
+
+  // Persistence pressure
+  const maxPersistence = Math.max(
+    0,
+    ...uncleared.map((m) => m.persistenceScore),
+  );
+  score += maxPersistence * 2;
+
+  // Foundational severity bonus
+  if (uncleared.some((m) => m.severity === 'foundational')) {
+    score += 3;
+  }
+
+  return Math.round(score * 100) / 100;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sub-component: Language toggle button
+// Derived row model — one per student, combining all their topic documents
 // ─────────────────────────────────────────────────────────────────────────────
 
-function LanguageToggle() {
-  const { language, toggleLanguage } = useLanguage();
+interface StudentRow {
+  studentId: string;
+  /** Display name — falls back to studentId if we don't have a name field. */
+  displayName: string;
+  urgencyScore: number;
+  /** topic → data from the progress document for that topic */
+  topicMap: Record<
+    string,
+    {
+      tier: StudentTier;
+      misconceptions: ActiveMisconception[];
+      /** Short label for the dominant misconception (shown on hover). */
+      misconceptionLabel: string | null;
+      /** Has a recently cleared misconception (peer-explainer indicator). */
+      recentlyCleared: boolean;
+      /** Max persistence score across misconceptions in this cell. */
+      maxPersistence: number;
+    }
+  >;
+  /** All progress docs for this student (for the detail sheet). */
+  progressDocs: StudentProgress[];
+}
+
+function buildStudentRows(
+  docs: StudentProgress[],
+  topics: string[],
+  language: 'en' | 'bm',
+): StudentRow[] {
+  // Group by studentUid
+  const byStudent = new Map<string, StudentProgress[]>();
+  for (const d of docs) {
+    const list = byStudent.get(d.studentUid) ?? [];
+    list.push(d);
+    byStudent.set(d.studentUid, list);
+  }
+
+  const rows: StudentRow[] = [];
+
+  for (const [studentId, progressList] of byStudent) {
+    const topicMap: StudentRow['topicMap'] = {};
+    let totalUrgency = 0;
+
+    for (const topic of topics) {
+      const prog = progressList.find((p) => p.topic === topic);
+      if (!prog) {
+        topicMap[topic] = {
+          tier: 'green', // placeholder — will be shown as gray
+          misconceptions: [],
+          misconceptionLabel: null,
+          recentlyCleared: false,
+          maxPersistence: 0,
+        };
+        // Mark as "no data" — we use a sentinel
+        (topicMap[topic] as Record<string, unknown>)._noData = true;
+        continue;
+      }
+
+      const uncleared = prog.activeMisconceptions.filter((m) => !m.isCleared);
+      const now = Date.now();
+      const recentlyCleared = prog.activeMisconceptions.some(
+        (m) => m.isCleared && now - m.lastSeen < SEVEN_DAYS_MS,
+      );
+
+      // Pick the dominant misconception label for hover
+      const dominant = [...uncleared].sort(
+        (a, b) => b.persistenceScore - a.persistenceScore,
+      )[0];
+
+      // We don't have per-misconception EN/BM labels in activeMisconceptions,
+      // so we use the misconceptionId as a short label. In a full system this
+      // would be looked up from the misconceptions catalogue.
+      const misconceptionLabel = dominant
+        ? dominant.misconceptionId.replace(/_/g, ' ')
+        : null;
+
+      const maxPersistence = Math.max(
+        0,
+        ...uncleared.map((m) => m.persistenceScore),
+      );
+
+      topicMap[topic] = {
+        tier: prog.tier,
+        misconceptions: prog.activeMisconceptions,
+        misconceptionLabel,
+        recentlyCleared,
+        maxPersistence,
+      };
+
+      totalUrgency += computeUrgencyScore(prog);
+    }
+
+    rows.push({
+      studentId,
+      displayName: studentId, // Will be enriched when student profile exists
+      urgencyScore: Math.round(totalUrgency * 100) / 100,
+      topicMap,
+      progressDocs: progressList,
+    });
+  }
+
+  return rows;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Firebase client initialisation (reusable, matches existing codebase pattern)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getClientFirestore() {
+  const { initializeApp, getApps } = await import('firebase/app');
+  const { getFirestore } = await import('firebase/firestore');
+
+  const firebaseConfig = {
+    apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+    authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+    projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  };
+
+  const app =
+    getApps().length > 0
+      ? getApps()[0]
+      : initializeApp(firebaseConfig, 'client');
+
+  return getFirestore(app);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// useClassProgress — realtime subscription to studentProgress/{classId}
+// ─────────────────────────────────────────────────────────────────────────────
+
+function useClassProgress(classId: string) {
+  const [docs, setDocs] = useState<StudentProgress[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let unsubscribe: (() => void) | null = null;
+    let cancelled = false;
+
+    (async () => {
+      const { collection, query, where, onSnapshot } = await import(
+        'firebase/firestore'
+      );
+      const db = await getClientFirestore();
+
+      const q = query(
+        collection(db, 'studentProgress'),
+        where('classId', '==', classId),
+      );
+
+      unsubscribe = onSnapshot(q, (snapshot) => {
+        if (cancelled) return;
+        const results: StudentProgress[] = [];
+        snapshot.forEach((doc) => {
+          results.push(doc.data() as StudentProgress);
+        });
+        setDocs(results);
+        setLoading(false);
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  }, [classId]);
+
+  return { docs, loading };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-component: Sheet (inline — replaces @/components/ui/sheet for now)
+// ─────────────────────────────────────────────────────────────────────────────
+// TODO: Replace with shadcn <Sheet> once `npx shadcn-ui@latest add sheet` is
+// run. The API below is intentionally compatible.
+
+function Sheet({
+  open,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  // Lock body scroll when open
+  useEffect(() => {
+    if (open) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = '';
+    }
+    return () => {
+      document.body.style.overflow = '';
+    };
+  }, [open]);
 
   return (
-    <button
-      type="button"
-      id="gap-map-language-toggle"
-      onClick={toggleLanguage}
-      aria-label="Toggle display language"
-      className={cn(
-        'flex items-center gap-1 px-3 py-1.5 rounded-full border-2 text-xs font-bold',
-        'transition-all duration-200 select-none',
-        language === 'bm'
-          ? 'border-blue-500 bg-blue-50 text-blue-700'
-          : 'border-slate-300 bg-white text-slate-600 hover:border-blue-300 hover:text-blue-600',
+    <AnimatePresence>
+      {open && (
+        <>
+          {/* Backdrop */}
+          <motion.div
+            key="sheet-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm"
+            onClick={onClose}
+            aria-hidden="true"
+          />
+          {/* Panel */}
+          <motion.aside
+            key="sheet-panel"
+            initial={{ x: '100%' }}
+            animate={{ x: 0 }}
+            exit={{ x: '100%' }}
+            transition={{ type: 'spring', damping: 28, stiffness: 300 }}
+            className={cn(
+              'fixed right-0 top-0 z-50 h-full w-full max-w-md',
+              'bg-white shadow-2xl overflow-y-auto',
+              'border-l border-gray-200',
+            )}
+            role="dialog"
+            aria-modal="true"
+          >
+            {children}
+          </motion.aside>
+        </>
       )}
-    >
-      <span className={language === 'en' ? 'opacity-100' : 'opacity-40'}>EN</span>
-      <span className="opacity-30 font-normal">|</span>
-      <span className={language === 'bm' ? 'opacity-100' : 'opacity-40'}>BM</span>
-    </button>
+    </AnimatePresence>
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sub-component: Heat cell
+// Sub-component: StudentDetailSheet
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface HeatCellProps {
-  cell: MisconceptionCellData;
-  isHighlighted: boolean;
-  onClick?: () => void;
+interface StudentDetailSheetProps {
+  open: boolean;
+  onClose: () => void;
+  student: StudentRow | null;
+  language: 'en' | 'bm';
 }
 
-function HeatCell({ cell, isHighlighted, onClick }: HeatCellProps) {
-  const { language } = useLanguage();
-  const [hovered, setHovered] = useState(false);
+function StudentDetailSheet({
+  open,
+  onClose,
+  student,
+  language,
+}: StudentDetailSheetProps) {
+  const t = COPY[language];
+  const [overrideSubmitted, setOverrideSubmitted] = useState(false);
 
-  const colours = heatColour(cell.prevalence);
-  const dot = heatDot(cell.prevalence);
-  const displayName = language === 'bm' ? cell.name_bm : cell.name;
-  const pct = Math.round(cell.prevalence * 100);
+  // Reset override state when sheet is re-opened for a new student
+  useEffect(() => {
+    if (open) setOverrideSubmitted(false);
+  }, [open, student?.studentId]);
+
+  const handleOverride = useCallback(async () => {
+    if (!student) return;
+    try {
+      await fetch('/api/teacher/override', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ studentId: student.studentId }),
+      });
+      setOverrideSubmitted(true);
+    } catch {
+      // Silently fail — teacher can retry
+    }
+  }, [student]);
+
+  if (!student) return null;
+
+  // Gather all uncleared misconceptions from every topic document
+  const allMisconceptions = student.progressDocs.flatMap((p) =>
+    p.activeMisconceptions
+      .filter((m) => !m.isCleared)
+      .map((m) => ({ ...m, topic: p.topic })),
+  );
 
   return (
-    <div className="relative group">
-      <button
-        type="button"
-        onClick={onClick}
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
-        aria-label={`${displayName}: ${pct}% of class`}
-        className={cn(
-          'w-full min-h-[72px] p-2.5 rounded-xl border-2 text-left',
-          'transition-all duration-200 active:scale-[0.97]',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2',
-          colours,
-          isHighlighted && 'ring-2 ring-blue-400 ring-offset-2',
-          onClick ? 'cursor-pointer hover:shadow-md' : 'cursor-default',
-        )}
-      >
-        {/* Header row: dot + % */}
-        <div className="flex items-center justify-between mb-1.5">
-          <span
-            className={cn('w-2 h-2 rounded-full flex-shrink-0', dot)}
-            aria-hidden="true"
-          />
-          <span className="text-[10px] font-bold tabular-nums">
-            {cell.studentCount > 0 ? `${pct}%` : '—'}
-          </span>
+    <Sheet open={open} onClose={onClose}>
+      <div className="flex flex-col h-full">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">
+              {student.displayName}
+            </h3>
+            <p className="text-xs text-gray-500 mt-0.5">{t.sheetTitle}</p>
+          </div>
+          <button
+            onClick={onClose}
+            className={cn(
+              'w-8 h-8 rounded-full flex items-center justify-center',
+              'text-gray-400 hover:text-gray-700 hover:bg-gray-100',
+              'transition-colors duration-150',
+            )}
+            aria-label={t.close}
+          >
+            ✕
+          </button>
         </div>
 
-        {/* Misconception name */}
-        <p className="text-[11px] leading-snug font-medium line-clamp-2">
-          {displayName}
-        </p>
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+          {/* Misconceptions list */}
+          <div>
+            <h4 className="text-sm font-semibold text-gray-700 mb-3">
+              {t.activeMisconceptions}
+            </h4>
 
-        {/* Student count */}
-        {cell.studentCount > 0 && (
-          <p className="text-[10px] mt-1 opacity-60">
-            {cell.studentCount} student{cell.studentCount !== 1 ? 's' : ''}
-          </p>
-        )}
-      </button>
+            {allMisconceptions.length === 0 ? (
+              <p className="text-sm text-gray-400 italic">
+                {t.noMisconceptions}
+              </p>
+            ) : (
+              <ul className="space-y-3">
+                {allMisconceptions
+                  .sort((a, b) => b.persistenceScore - a.persistenceScore)
+                  .map((m) => (
+                    <li
+                      key={m.misconceptionId + m.topic}
+                      className="rounded-xl border border-gray-100 bg-gray-50 px-4 py-3"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-800 leading-snug">
+                            {m.misconceptionId.replace(/_/g, ' ')}
+                          </p>
+                          <p className="text-xs text-gray-500 mt-1 capitalize">
+                            {m.topic} · {m.severity}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          {m.persistenceScore > 3 && (
+                            <span
+                              title={`${t.persistence}: ${m.persistenceScore.toFixed(1)}`}
+                              className="text-amber-500"
+                            >
+                              ⚠️
+                            </span>
+                          )}
+                          <span
+                            className={cn(
+                              'text-xs font-semibold px-2 py-0.5 rounded-full',
+                              m.persistenceScore > 3
+                                ? 'bg-red-100 text-red-700'
+                                : m.persistenceScore > 1.5
+                                  ? 'bg-amber-100 text-amber-700'
+                                  : 'bg-gray-100 text-gray-600',
+                            )}
+                          >
+                            {m.persistenceScore.toFixed(1)}
+                          </span>
+                        </div>
+                      </div>
+                    </li>
+                  ))}
+              </ul>
+            )}
+          </div>
+        </div>
 
-      {/* Tooltip — shows full name when truncated */}
-      {hovered && displayName.length > 40 && (
-        <div
-          className={cn(
-            'absolute z-20 bottom-full left-0 mb-1.5 w-56',
-            'bg-slate-800 text-white text-[11px] leading-snug',
-            'px-3 py-2 rounded-lg shadow-xl pointer-events-none',
+        {/* Footer */}
+        <div className="px-6 py-4 border-t border-gray-100">
+          {overrideSubmitted ? (
+            <motion.p
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="text-sm font-medium text-green-600 text-center"
+            >
+              ✓ {t.overrideConfirm}
+            </motion.p>
+          ) : (
+            <button
+              id="override-classification-btn"
+              onClick={handleOverride}
+              className={cn(
+                'w-full py-3 rounded-xl text-sm font-semibold',
+                'bg-gray-900 text-white',
+                'hover:bg-gray-800 active:bg-gray-950',
+                'transition-colors duration-150',
+                'shadow-sm hover:shadow-md',
+              )}
+            >
+              {t.overrideBtn}
+            </button>
           )}
-          role="tooltip"
-        >
-          {displayName}
-          <div className="absolute top-full left-4 border-4 border-transparent border-t-slate-800" />
         </div>
+      </div>
+    </Sheet>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-component: Heatmap Cell
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface HeatmapCellProps {
+  tier: StudentTier | 'gray';
+  misconceptionLabel: string | null;
+  persistenceHigh: boolean;
+  recentlyCleared: boolean;
+  onClick: () => void;
+}
+
+function HeatmapCell({
+  tier,
+  misconceptionLabel,
+  persistenceHigh,
+  recentlyCleared,
+  onClick,
+}: HeatmapCellProps) {
+  const bg = TIER_COLORS[tier];
+  const fg = TIER_TEXT_COLORS[tier];
+
+  return (
+    <motion.button
+      type="button"
+      onClick={onClick}
+      whileHover={{ scale: 1.08, zIndex: 10 }}
+      whileTap={{ scale: 0.95 }}
+      title={
+        tier === 'gray'
+          ? 'No data'
+          : misconceptionLabel
+            ? misconceptionLabel
+            : tier
+      }
+      className={cn(
+        'relative w-full aspect-square rounded-lg',
+        'flex items-center justify-center',
+        'cursor-pointer select-none',
+        'transition-shadow duration-150',
+        'hover:shadow-lg hover:ring-2 hover:ring-offset-1',
+        tier === 'red' && 'hover:ring-red-400',
+        tier === 'yellow' && 'hover:ring-amber-400',
+        tier === 'green' && 'hover:ring-emerald-400',
+        tier === 'blue' && 'hover:ring-blue-400',
+        tier === 'gray' && 'hover:ring-gray-400',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2',
       )}
-    </div>
+      style={{ backgroundColor: bg, color: fg }}
+    >
+      {/* Persistence flag */}
+      {persistenceHigh && (
+        <span
+          className="absolute -top-1 -right-1 text-xs leading-none"
+          aria-label="Persistent misconception"
+        >
+          ⚠️
+        </span>
+      )}
+
+      {/* Peer explainer indicator */}
+      {recentlyCleared && (
+        <span
+          className="absolute -bottom-1 -right-1 text-xs leading-none"
+          aria-label="Recently cleared"
+        >
+          💬
+        </span>
+      )}
+
+      {/* Misconception short label on red cells */}
+      {tier === 'red' && misconceptionLabel && (
+        <span className="text-[9px] leading-tight font-medium text-center px-0.5 line-clamp-2 opacity-90">
+          {misconceptionLabel}
+        </span>
+      )}
+    </motion.button>
   );
 }
 
@@ -169,116 +619,234 @@ function HeatCell({ cell, isHighlighted, onClick }: HeatCellProps) {
 // Sub-component: Legend
 // ─────────────────────────────────────────────────────────────────────────────
 
-function HeatLegend() {
-  const { language } = useLanguage();
-  const items = [
-    { dot: 'bg-slate-200', label: language === 'bm' ? 'Tiada' : 'None', range: '0%' },
-    { dot: 'bg-green-400', label: language === 'bm' ? 'Rendah' : 'Low', range: '<15%' },
-    { dot: 'bg-yellow-400', label: language === 'bm' ? 'Sederhana' : 'Moderate', range: '15–35%' },
-    { dot: 'bg-orange-400', label: language === 'bm' ? 'Tinggi' : 'High', range: '35–55%' },
-    { dot: 'bg-red-500', label: language === 'bm' ? 'Kritikal' : 'Critical', range: '>55%' },
+function Legend({ language }: { language: 'en' | 'bm' }) {
+  const t = COPY[language];
+
+  const items: { color: string; label: string }[] = [
+    { color: TIER_COLORS.red, label: t.legendRed },
+    { color: TIER_COLORS.yellow, label: t.legendYellow },
+    { color: TIER_COLORS.green, label: t.legendGreen },
+    { color: TIER_COLORS.blue, label: t.legendBlue },
   ];
 
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
-      {items.map(({ dot, label, range }) => (
-        <div key={range} className="flex items-center gap-1.5 text-[10px] text-slate-500">
-          <span className={cn('w-2 h-2 rounded-full flex-shrink-0', dot)} />
-          <span className="font-medium">{label}</span>
-          <span className="opacity-60">({range})</span>
-        </div>
-      ))}
+    <div className="mt-5 px-1">
+      <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+        {t.legendTitle}
+      </p>
+      <div className="flex flex-wrap gap-x-5 gap-y-1.5">
+        {items.map((item) => (
+          <span key={item.color} className="flex items-center gap-1.5 text-xs text-gray-600">
+            <span
+              className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+              style={{ backgroundColor: item.color }}
+            />
+            {item.label}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main component: ClassGapMap
+// Main component
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function ClassGapMap({
-  classSize,
-  rows,
-  highlightMisconceptionId,
-  onCellClick,
+  classId,
+  topics,
+  language,
 }: ClassGapMapProps) {
-  const { language } = useLanguage();
+  const t = COPY[language];
+  const { docs, loading } = useClassProgress(classId);
 
-  const headerLabel = language === 'bm' ? 'Peta Jurang Kelas' : 'Class Gap Map';
-  const subLabel =
-    language === 'bm'
-      ? `${classSize} pelajar · Kemas kini masa nyata`
-      : `${classSize} students · Live prevalence`;
+  const [sortMode, setSortMode] = useState<SortMode>('priority');
+  const [selectedStudent, setSelectedStudent] = useState<StudentRow | null>(
+    null,
+  );
+  const [sheetOpen, setSheetOpen] = useState(false);
 
+  // Build & sort rows
+  const rows = useMemo(() => {
+    const built = buildStudentRows(docs, topics, language);
+    if (sortMode === 'priority') {
+      built.sort((a, b) => b.urgencyScore - a.urgencyScore);
+    } else {
+      built.sort((a, b) =>
+        a.displayName.localeCompare(b.displayName, language === 'bm' ? 'ms' : 'en'),
+      );
+    }
+    return built;
+  }, [docs, topics, language, sortMode]);
+
+  const handleCellClick = useCallback((student: StudentRow) => {
+    setSelectedStudent(student);
+    setSheetOpen(true);
+  }, []);
+
+  const handleSheetClose = useCallback(() => {
+    setSheetOpen(false);
+  }, []);
+
+  // ── Loading state ─────────────────────────────────────────────────────────
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16">
+        <motion.div
+          animate={{ rotate: 360 }}
+          transition={{ duration: 1.2, repeat: Infinity, ease: 'linear' }}
+          className="w-6 h-6 border-2 border-gray-300 border-t-gray-700 rounded-full"
+        />
+        <span className="ml-3 text-sm text-gray-500">{t.loading}</span>
+      </div>
+    );
+  }
+
+  // ── Empty state ───────────────────────────────────────────────────────────
+  if (rows.length === 0) {
+    return (
+      <div className="text-center py-16">
+        <p className="text-sm text-gray-400">{t.noData}</p>
+      </div>
+    );
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-      {/* ── Header ── */}
-      <div className="px-5 py-4 border-b border-slate-100 flex items-start justify-between gap-4 flex-wrap">
+    <section
+      id="class-gap-map"
+      className="w-full"
+      aria-label={t.title}
+    >
+      {/* Header bar */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
         <div>
-          <h2 className="text-base font-bold text-slate-800">{headerLabel}</h2>
-          <p className="text-xs text-slate-500 mt-0.5">{subLabel}</p>
+          <h2 className="text-base font-bold text-gray-900">{t.title}</h2>
+          <p className="text-xs text-gray-500 mt-0.5">{t.subtitle}</p>
         </div>
 
-        {/* Language toggle — top-right corner */}
-        <LanguageToggle />
+        {/* Sort toggle */}
+        <div
+          className="inline-flex rounded-lg bg-gray-100 p-0.5"
+          role="radiogroup"
+          aria-label="Sort mode"
+        >
+          {(
+            [
+              { mode: 'priority' as SortMode, label: t.priorityView },
+              { mode: 'name' as SortMode, label: t.nameView },
+            ] as const
+          ).map(({ mode, label }) => (
+            <button
+              key={mode}
+              role="radio"
+              aria-checked={sortMode === mode}
+              onClick={() => setSortMode(mode)}
+              className={cn(
+                'px-3 py-1.5 text-xs font-medium rounded-md transition-all duration-150',
+                sortMode === mode
+                  ? 'bg-white text-gray-900 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-700',
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* ── Legend ── */}
-      <div className="px-5 py-3 border-b border-slate-100 bg-slate-50/50">
-        <HeatLegend />
+      {/* Heatmap grid */}
+      <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white shadow-sm">
+        <table className="w-full border-collapse min-w-[480px]">
+          <thead>
+            <tr className="border-b border-gray-100">
+              <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-3 sticky left-0 bg-white z-10 min-w-[140px]">
+                {t.student}
+              </th>
+              {topics.map((topic) => (
+                <th
+                  key={topic}
+                  className="text-center text-xs font-semibold text-gray-500 uppercase tracking-wider px-2 py-3 min-w-[72px]"
+                >
+                  {topic}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            <AnimatePresence mode="popLayout">
+              {rows.map((student) => (
+                <motion.tr
+                  key={student.studentId}
+                  layout
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: 0.2 }}
+                  className="border-b border-gray-50 last:border-b-0 group"
+                >
+                  {/* Student name cell */}
+                  <td className="px-4 py-2.5 sticky left-0 bg-white z-10 group-hover:bg-gray-50 transition-colors">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-gray-800 truncate max-w-[120px]">
+                        {student.displayName}
+                      </span>
+                      {sortMode === 'priority' && (
+                        <span className="text-[10px] text-gray-400 font-mono flex-shrink-0">
+                          {student.urgencyScore.toFixed(1)}
+                        </span>
+                      )}
+                    </div>
+                  </td>
+
+                  {/* Topic cells */}
+                  {topics.map((topic) => {
+                    const cell = student.topicMap[topic];
+                    const isNoData =
+                      !cell ||
+                      (cell as Record<string, unknown>)._noData === true;
+                    const tier: StudentTier | 'gray' = isNoData
+                      ? 'gray'
+                      : cell.tier;
+
+                    return (
+                      <td key={topic} className="px-2 py-2">
+                        <div className="w-full max-w-[48px] mx-auto">
+                          <HeatmapCell
+                            tier={tier}
+                            misconceptionLabel={
+                              isNoData ? null : cell.misconceptionLabel
+                            }
+                            persistenceHigh={
+                              !isNoData && cell.maxPersistence > 3
+                            }
+                            recentlyCleared={
+                              !isNoData && cell.recentlyCleared
+                            }
+                            onClick={() => handleCellClick(student)}
+                          />
+                        </div>
+                      </td>
+                    );
+                  })}
+                </motion.tr>
+              ))}
+            </AnimatePresence>
+          </tbody>
+        </table>
       </div>
 
-      {/* ── Heatmap grid ── */}
-      <div className="p-5 space-y-6 overflow-x-auto">
-        {rows.length === 0 ? (
-          <p className="text-sm text-slate-400 text-center py-8">
-            {language === 'bm'
-              ? 'Tiada data tersedia.'
-              : 'No data available yet.'}
-          </p>
-        ) : (
-          rows.map((row) => {
-            const topicName = language === 'bm' ? row.topic_bm : row.topic;
+      {/* Legend */}
+      <Legend language={language} />
 
-            return (
-              <div key={row.topic}>
-                {/* Topic label */}
-                <p className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-2.5">
-                  {topicName}
-                </p>
-
-                {/* Misconception cells grid */}
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2.5">
-                  {row.misconceptions.map((cell) => (
-                    <HeatCell
-                      key={cell.misconceptionId}
-                      cell={cell}
-                      isHighlighted={
-                        cell.misconceptionId === highlightMisconceptionId
-                      }
-                      onClick={
-                        onCellClick
-                          ? () => onCellClick(cell.misconceptionId, row.topic)
-                          : undefined
-                      }
-                    />
-                  ))}
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
-
-      {/* ── Footer ── */}
-      <div className="px-5 py-3 border-t border-slate-100 flex items-center gap-1.5">
-        <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-        <span className="text-[10px] text-slate-400">
-          {language === 'bm'
-            ? 'Dikemas kini secara langsung apabila pelajar menjawab'
-            : 'Updates live as students answer'}
-        </span>
-      </div>
-    </div>
+      {/* Student Detail Sheet */}
+      <StudentDetailSheet
+        open={sheetOpen}
+        onClose={handleSheetClose}
+        student={selectedStudent}
+        language={language}
+      />
+    </section>
   );
 }
