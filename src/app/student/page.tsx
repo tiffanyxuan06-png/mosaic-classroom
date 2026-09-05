@@ -25,6 +25,45 @@ const STUDENT_ID = 'demo_student_001';
 const CLASS_ID = 'class_6A';
 const TOTAL_MISSIONS = 4;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pulse types
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface PulseQuestion {
+  questionId: string;
+  questionText: string;
+  options: { A: string; B: string; C: string; D: string };
+  correctOption: string;
+}
+
+interface PulseDoc {
+  pulseId: string;
+  classId: string;
+  questions: PulseQuestion[];
+  status: 'active' | 'completed' | 'expired';
+  createdAt: number;
+  expiresAt: number;
+}
+
+// Firebase client init (matches codebase pattern)
+async function getClientFirestore() {
+  const { initializeApp, getApps } = await import('firebase/app');
+  const { getFirestore } = await import('firebase/firestore');
+
+  const firebaseConfig = {
+    apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+    authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+    projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  };
+
+  const app =
+    getApps().length > 0
+      ? getApps()[0]
+      : initializeApp(firebaseConfig, 'client');
+
+  return getFirestore(app);
+}
+
 const MISSIONS: Record<number, { label_en: string; label_bm: string }> = {
   0: {
     label_en: 'Mission 1: Build equivalent fractions',
@@ -345,6 +384,192 @@ function ErrorBanner({ message, onRetry }: { message: string; onRetry: () => voi
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sub-component: Pulse toast banner
+// ─────────────────────────────────────────────────────────────────────────────
+
+function PulseToast({
+  visible,
+  language,
+}: {
+  visible: boolean;
+  language: Language;
+}) {
+  const msg =
+    language === 'bm'
+      ? 'Guru anda telah menghantar semakan pantas!'
+      : 'Your teacher has sent a quick check!';
+
+  return (
+    <AnimatePresence>
+      {visible && (
+        <motion.div
+          initial={{ opacity: 0, y: -20, x: '-50%' }}
+          animate={{ opacity: 1, y: 0, x: '-50%' }}
+          exit={{ opacity: 0, y: -20, x: '-50%' }}
+          transition={{ duration: 0.3 }}
+          className="fixed top-4 left-1/2 z-50 px-5 py-3 rounded-xl shadow-lg bg-blue-600 text-white text-sm font-semibold"
+        >
+          📡 {msg}
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-component: PulseQuiz overlay
+// ─────────────────────────────────────────────────────────────────────────────
+
+function PulseQuizOverlay({
+  pulse,
+  studentId,
+  language,
+  onComplete,
+}: {
+  pulse: PulseDoc;
+  studentId: string;
+  language: Language;
+  onComplete: () => void;
+}) {
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [answers, setAnswers] = useState<
+    { questionIndex: number; selectedOption: string }[]
+  >([]);
+  const [selectedOption, setSelectedOption] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const question = pulse.questions[currentIndex];
+  const isLast = currentIndex === pulse.questions.length - 1;
+
+  const headerText =
+    language === 'bm' ? 'Semakan Nadi Guru' : 'Teacher Pulse Check';
+  const progressText =
+    language === 'bm'
+      ? `Soalan ${currentIndex + 1} daripada ${pulse.questions.length}`
+      : `Question ${currentIndex + 1} of ${pulse.questions.length}`;
+  const nextText = language === 'bm' ? 'Seterusnya' : 'Next';
+  const submitText = language === 'bm' ? 'Hantar' : 'Submit';
+
+  const handleNext = useCallback(async () => {
+    if (!selectedOption) return;
+
+    const newAnswers = [
+      ...answers,
+      { questionIndex: currentIndex, selectedOption },
+    ];
+    setAnswers(newAnswers);
+
+    if (isLast) {
+      // Write pulseResponse to Firestore
+      setSubmitting(true);
+      try {
+        const { doc: clientDoc, setDoc: clientSetDoc } = await import(
+          'firebase/firestore'
+        );
+        const db = await getClientFirestore();
+
+        const responseId = `${pulse.pulseId}_${studentId}`;
+        const ref = clientDoc(db, 'pulseResponses', responseId);
+        await clientSetDoc(ref, {
+          pulseId: pulse.pulseId,
+          studentId,
+          classId: pulse.classId,
+          answers: newAnswers,
+          completedAt: Date.now(),
+        });
+      } catch (err) {
+        console.error('[student] pulse response write failed:', err);
+      }
+      setSubmitting(false);
+      onComplete();
+    } else {
+      setCurrentIndex((i) => i + 1);
+      setSelectedOption(null);
+    }
+  }, [selectedOption, answers, currentIndex, isLast, pulse, studentId, onComplete]);
+
+  if (!question) return null;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-40 flex items-center justify-center p-4"
+    >
+      {/* Backdrop */}
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+
+      {/* Card */}
+      <motion.div
+        initial={{ scale: 0.9, y: 20 }}
+        animate={{ scale: 1, y: 0 }}
+        exit={{ scale: 0.9, y: 20 }}
+        transition={{ type: 'spring', damping: 25, stiffness: 300 }}
+        className="relative z-10 w-full max-w-lg bg-white rounded-2xl shadow-2xl overflow-hidden"
+      >
+        {/* Header */}
+        <div className="bg-gradient-to-r from-blue-500 to-indigo-600 px-5 py-4">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+            <h2 className="text-white font-bold text-sm">{headerText}</h2>
+          </div>
+          <p className="text-blue-100 text-xs">{progressText}</p>
+        </div>
+
+        {/* Question */}
+        <div className="px-5 py-5 space-y-4">
+          <p className="text-sm font-medium text-gray-800 leading-relaxed">
+            {question.questionText}
+          </p>
+
+          {/* Options — no confidence buttons for pulse */}
+          <div className="space-y-2">
+            {(['A', 'B', 'C', 'D'] as const).map((opt) => (
+              <button
+                key={opt}
+                type="button"
+                onClick={() => setSelectedOption(opt)}
+                className={cn(
+                  'w-full text-left px-4 py-3 rounded-xl border-2 text-sm',
+                  'transition-all duration-150',
+                  selectedOption === opt
+                    ? 'border-blue-500 bg-blue-50 text-blue-800 font-semibold'
+                    : 'border-gray-200 bg-white text-gray-700 hover:border-blue-200 hover:bg-blue-50/30',
+                )}
+              >
+                <span className="font-bold mr-2 text-gray-400">{opt}.</span>
+                {question.options[opt]}
+              </button>
+            ))}
+          </div>
+
+          {/* Next/Submit button */}
+          <button
+            type="button"
+            onClick={handleNext}
+            disabled={!selectedOption || submitting}
+            className={cn(
+              'w-full py-3 rounded-xl text-sm font-semibold',
+              'transition-all duration-150',
+              !selectedOption || submitting
+                ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                : 'bg-blue-600 text-white hover:bg-blue-700 shadow-sm',
+            )}
+          >
+            {submitting
+              ? '...'
+              : isLast
+              ? submitText
+              : nextText}
+          </button>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main page
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -361,6 +586,11 @@ export default function StudentPage() {
 
   const [studentProgress, setStudentProgress] =
     useState<StudentProgress | null>(null);
+
+  // Pulse state
+  const [activePulse, setActivePulse] = useState<PulseDoc | null>(null);
+  const [showPulseToast, setShowPulseToast] = useState(false);
+  const [showPulseOverlay, setShowPulseOverlay] = useState(false);
 
   // Tracking refs across question chain
   const consecutiveCorrectRef = useRef(0);
@@ -578,12 +808,83 @@ export default function StudentPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ── Pulse detection ─────────────────────────────────────────────────────
+
+  useEffect(() => {
+    let unsubscribe: (() => void) | null = null;
+    let cancelled = false;
+
+    (async () => {
+      const { collection, query, where, onSnapshot } = await import(
+        'firebase/firestore'
+      );
+      const db = await getClientFirestore();
+
+      const q = query(
+        collection(db, 'pulses'),
+        where('classId', '==', CLASS_ID),
+        where('status', '==', 'active'),
+      );
+
+      unsubscribe = onSnapshot(q, (snapshot) => {
+        if (cancelled) return;
+
+        // Find the most recent active pulse
+        let latest: PulseDoc | null = null;
+        snapshot.forEach((doc) => {
+          const data = doc.data() as PulseDoc;
+          if (!latest || data.createdAt > latest.createdAt) {
+            latest = data;
+          }
+        });
+
+        if (latest && (!activePulse || latest.pulseId !== activePulse.pulseId)) {
+          setActivePulse(latest);
+          setShowPulseToast(true);
+          setShowPulseOverlay(true);
+
+          // Auto-hide toast after 4 seconds
+          setTimeout(() => setShowPulseToast(false), 4000);
+        } else if (!latest) {
+          setActivePulse(null);
+          setShowPulseOverlay(false);
+        }
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePulse?.pulseId]);
+
+  const handlePulseComplete = useCallback(() => {
+    setShowPulseOverlay(false);
+    setActivePulse(null);
+  }, []);
+
   // ─────────────────────────────────────────────────────────────────────────
   // Render
   // ─────────────────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-violet-50/20">
+      {/* ── Pulse toast ── */}
+      <PulseToast visible={showPulseToast} language={language} />
+
+      {/* ── Pulse quiz overlay ── */}
+      <AnimatePresence>
+        {showPulseOverlay && activePulse && (
+          <PulseQuizOverlay
+            pulse={activePulse}
+            studentId={STUDENT_ID}
+            language={language}
+            onComplete={handlePulseComplete}
+          />
+        )}
+      </AnimatePresence>
+
       {/* ── Page header ── */}
       <header className="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-slate-100 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-4">
