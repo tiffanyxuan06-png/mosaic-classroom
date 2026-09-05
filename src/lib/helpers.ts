@@ -197,6 +197,63 @@ function createProgress(answer: Answer): StudentProgress {
   };
 }
 
+/**
+ * Applies one answer to a progress object in memory, with no database round
+ * trip — used offline so a student keeps seeing their tier move while writes
+ * sit in the queue. The authoritative version (`updateStudentProgress`) runs
+ * the same rules server-side on replay and overwrites this; the only thing
+ * lost here is the catalogue lookup, so a misconception first seen offline
+ * defaults to 'conceptual' severity until it syncs.
+ */
+export function applyAnswerLocally(
+  progress: StudentProgress,
+  answer: { isCorrect: boolean; misconceptionId: string | null },
+): StudentProgress {
+  const next: StudentProgress = {
+    ...progress,
+    activeMisconceptions: progress.activeMisconceptions.map((m) => ({ ...m })),
+  };
+  const now = Date.now();
+
+  if (answer.isCorrect) {
+    next.consecutiveCorrect += 1;
+  } else {
+    next.consecutiveCorrect = 0;
+    next.transferPassed = false;
+
+    if (answer.misconceptionId) {
+      const sessionsActive = Math.max(1, next.sessionsActive ?? 1);
+      const existing = next.activeMisconceptions.find(
+        (m) => m.misconceptionId === answer.misconceptionId,
+      );
+
+      if (existing) {
+        existing.occurrenceCount += 1;
+        existing.lastSeen = now;
+        existing.isCleared = false;
+        existing.persistenceScore = calculatePersistenceScore(
+          existing.occurrenceCount,
+          now,
+          sessionsActive,
+        );
+      } else {
+        next.activeMisconceptions.push({
+          misconceptionId: answer.misconceptionId,
+          severity: 'conceptual',
+          prerequisite_misconception_id: null,
+          occurrenceCount: 1,
+          persistenceScore: calculatePersistenceScore(1, now, sessionsActive),
+          lastSeen: now,
+          isCleared: false,
+        });
+      }
+    }
+  }
+
+  next.tier = calculateTier(next);
+  return next;
+}
+
 async function lookupMisconception(
   db: SupabaseClient,
   misconceptionId: string,

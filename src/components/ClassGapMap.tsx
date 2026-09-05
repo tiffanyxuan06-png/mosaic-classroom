@@ -4,6 +4,16 @@ import { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 import { supabase } from '@/lib/supabase-client';
+import { useClassContext } from '@/lib/useClassContext';
+import {
+  REPEAT_ALERT_THRESHOLD,
+  clusterByMisconception,
+  buildMisconceptionColorIndex,
+  misconceptionShortLabel,
+  studentName as resolveStudentName,
+  type ClassContext,
+  type MisconceptionCluster,
+} from '@/lib/classInsights';
 import type {
   StudentProgress,
   ActiveMisconception,
@@ -42,6 +52,32 @@ const TIER_TEXT_COLORS: Record<StudentTier | 'gray', string> = {
 
 type SortMode = 'priority' | 'name';
 
+/**
+ * Colour view: `tier` answers "how far along is this student", `misconception`
+ * answers "which error pattern is this" — the typology view that lets a
+ * teacher see at a glance that a whole column shares one mental block.
+ */
+type ColorMode = 'tier' | 'misconception';
+
+/**
+ * Distinct hues for the misconception-typology view. Cells sharing a colour
+ * share the same error pattern, regardless of score.
+ */
+const MISCONCEPTION_COLORS = [
+  '#d81b60',
+  '#8e24aa',
+  '#3949ab',
+  '#00897b',
+  '#f4511e',
+  '#6d4c41',
+  '#00838f',
+  '#c0ca33',
+  '#5e35b1',
+  '#e53935',
+] as const;
+
+const CLEAR_COLOR = '#e8f0ea';
+
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,6 +113,14 @@ const COPY = {
     overrideBtn: 'Override Classification',
     overrideConfirm: 'Override submitted',
     close: 'Close',
+    tierView: 'By mastery',
+    misconceptionView: 'By misconception',
+    repeatedTimes: 'repeated',
+    times: 'times',
+    repeatAlert: 'Repeated 3+ times — needs intervention',
+    errorPatterns: 'Error patterns in this class',
+    noErrorPatterns: 'No active error patterns',
+    mastered: 'No active misconception',
   },
   bm: {
     title: 'Peta Jurang Kelas',
@@ -98,6 +142,14 @@ const COPY = {
     overrideBtn: 'Gantikan Pengelasan',
     overrideConfirm: 'Penggantian dihantar',
     close: 'Tutup',
+    tierView: 'Ikut penguasaan',
+    misconceptionView: 'Ikut salah faham',
+    repeatedTimes: 'berulang',
+    times: 'kali',
+    repeatAlert: 'Berulang 3+ kali — perlu campur tangan',
+    errorPatterns: 'Corak kesilapan dalam kelas ini',
+    noErrorPatterns: 'Tiada corak kesilapan aktif',
+    mastered: 'Tiada salah faham aktif',
   },
 } as const;
 
@@ -153,10 +205,16 @@ interface StudentRow {
       misconceptions: ActiveMisconception[];
       /** Short label for the dominant misconception (shown on hover). */
       misconceptionLabel: string | null;
+      /** Id of the dominant misconception — drives the typology colour. */
+      dominantMisconceptionId: string | null;
       /** Has a recently cleared misconception (peer-explainer indicator). */
       recentlyCleared: boolean;
       /** Max persistence score across misconceptions in this cell. */
       maxPersistence: number;
+      /** Highest repeat count among uncleared misconceptions in this cell. */
+      maxOccurrences: number;
+      /** True once a misconception here has been repeated 3+ times. */
+      repeatAlert: boolean;
     }
   >;
   /** All progress docs for this student (for the detail sheet). */
@@ -166,11 +224,8 @@ interface StudentRow {
 function buildStudentRows(
   docs: StudentProgress[],
   topics: string[],
-  // Not used yet — activeMisconceptions doesn't carry bilingual labels, so
-  // the dominant-misconception label below falls back to the raw id (see
-  // comment further down). Kept as a real param so the caller doesn't need
-  // to change once bilingual labels are wired in.
-  _language: 'en' | 'bm',
+  language: 'en' | 'bm',
+  context: ClassContext,
 ): StudentRow[] {
   // Group by studentUid
   const byStudent = new Map<string, StudentProgress[]>();
@@ -193,8 +248,11 @@ function buildStudentRows(
           tier: 'green', // placeholder — will be shown as gray
           misconceptions: [],
           misconceptionLabel: null,
+          dominantMisconceptionId: null,
           recentlyCleared: false,
           maxPersistence: 0,
+          maxOccurrences: 0,
+          repeatAlert: false,
         };
         // Mark as "no data" — we use a sentinel
         (topicMap[topic] as Record<string, unknown>)._noData = true;
@@ -212,24 +270,25 @@ function buildStudentRows(
         (a, b) => b.persistenceScore - a.persistenceScore,
       )[0];
 
-      // We don't have per-misconception EN/BM labels in activeMisconceptions,
-      // so we use the misconceptionId as a short label. In a full system this
-      // would be looked up from the misconceptions catalogue.
       const misconceptionLabel = dominant
-        ? dominant.misconceptionId.replace(/_/g, ' ')
+        ? misconceptionShortLabel(dominant.misconceptionId, context, language)
         : null;
 
       const maxPersistence = Math.max(
         0,
         ...uncleared.map((m) => m.persistenceScore),
       );
+      const maxOccurrences = Math.max(0, ...uncleared.map((m) => m.occurrenceCount));
 
       topicMap[topic] = {
         tier: prog.tier,
         misconceptions: prog.activeMisconceptions,
         misconceptionLabel,
+        dominantMisconceptionId: dominant?.misconceptionId ?? null,
         recentlyCleared,
         maxPersistence,
+        maxOccurrences,
+        repeatAlert: maxOccurrences >= REPEAT_ALERT_THRESHOLD,
       };
 
       totalUrgency += computeUrgencyScore(prog);
@@ -237,7 +296,7 @@ function buildStudentRows(
 
     rows.push({
       studentId,
-      displayName: studentId, // Will be enriched when student profile exists
+      displayName: resolveStudentName(studentId, context),
       urgencyScore: Math.round(totalUrgency * 100) / 100,
       topicMap,
       progressDocs: progressList,
@@ -414,6 +473,7 @@ interface StudentDetailSheetProps {
   onClose: () => void;
   student: StudentRow | null;
   language: 'en' | 'bm';
+  context: ClassContext;
 }
 
 function StudentDetailSheet({
@@ -421,6 +481,7 @@ function StudentDetailSheet({
   onClose,
   student,
   language,
+  context,
 }: StudentDetailSheetProps) {
   const t = COPY[language];
 
@@ -481,13 +542,26 @@ function StudentDetailSheet({
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex-1 min-w-0">
                           <p className="text-sm font-medium text-gray-800 leading-snug">
-                            {m.misconceptionId.replace(/_/g, ' ')}
+                            {misconceptionShortLabel(m.misconceptionId, context, language)}
                           </p>
                           <p className="text-xs text-gray-500 mt-1 capitalize">
-                            {m.topic} · {m.severity}
+                            {m.topic} · {m.severity} ·{' '}
+                            <span
+                              className={cn(
+                                m.occurrenceCount >= REPEAT_ALERT_THRESHOLD &&
+                                  'text-red-600 font-semibold',
+                              )}
+                            >
+                              {t.repeatedTimes} {m.occurrenceCount} {t.times}
+                            </span>
                           </p>
                         </div>
                         <div className="flex items-center gap-1.5 flex-shrink-0">
+                          {m.occurrenceCount >= REPEAT_ALERT_THRESHOLD && (
+                            <span title={t.repeatAlert} className="text-red-600">
+                              🔔
+                            </span>
+                          )}
                           {m.persistenceScore > 3 && (
                             <span
                               title={`${t.persistence}: ${m.persistenceScore.toFixed(1)}`}
@@ -530,6 +604,11 @@ interface HeatmapCellProps {
   misconceptionLabel: string | null;
   persistenceHigh: boolean;
   recentlyCleared: boolean;
+  repeatAlert: boolean;
+  occurrences: number;
+  /** Typology colour when colorMode is 'misconception'; null = mastered/no data. */
+  misconceptionColor: string | null;
+  colorMode: ColorMode;
   onClick: () => void;
 }
 
@@ -538,10 +617,21 @@ function HeatmapCell({
   misconceptionLabel,
   persistenceHigh,
   recentlyCleared,
+  repeatAlert,
+  occurrences,
+  misconceptionColor,
+  colorMode,
   onClick,
 }: HeatmapCellProps) {
-  const bg = TIER_COLORS[tier];
-  const fg = TIER_TEXT_COLORS[tier];
+  const useTypology = colorMode === 'misconception' && tier !== 'gray';
+  const bg = useTypology
+    ? misconceptionColor ?? CLEAR_COLOR
+    : TIER_COLORS[tier];
+  const fg = useTypology
+    ? misconceptionColor
+      ? '#ffffff'
+      : '#3c4043'
+    : TIER_TEXT_COLORS[tier];
 
   return (
     <motion.button
@@ -553,7 +643,7 @@ function HeatmapCell({
         tier === 'gray'
           ? 'No data'
           : misconceptionLabel
-            ? misconceptionLabel
+            ? `${misconceptionLabel}${occurrences > 0 ? ` — ${occurrences}×` : ''}`
             : tier
       }
       className={cn(
@@ -568,9 +658,26 @@ function HeatmapCell({
         tier === 'blue' && 'hover:ring-blue-400',
         tier === 'gray' && 'hover:ring-gray-400',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2',
+        // A repeated misconception outranks every other cell signal — ring it
+        // so it reads across the room during a lesson.
+        repeatAlert && 'ring-2 ring-offset-1 ring-red-600 animate-pulse',
       )}
       style={{ backgroundColor: bg, color: fg }}
     >
+      {/* Repeat-count badge — the 3+ intervention trigger */}
+      {repeatAlert && (
+        <span
+          className={cn(
+            'absolute -top-1.5 -left-1.5 min-w-[16px] h-4 px-1 rounded-full',
+            'bg-red-600 text-white text-[9px] font-bold leading-4 text-center',
+            'shadow-sm',
+          )}
+          aria-label={`Repeated ${occurrences} times`}
+        >
+          {occurrences}×
+        </span>
+      )}
+
       {/* Persistence flag */}
       {persistenceHigh && (
         <span
@@ -591,8 +698,9 @@ function HeatmapCell({
         </span>
       )}
 
-      {/* Misconception short label on red cells */}
-      {tier === 'red' && misconceptionLabel && (
+      {/* Misconception short label — always shown in typology view, and on
+          red cells in mastery view where the gap is the headline. */}
+      {(useTypology || tier === 'red') && misconceptionLabel && (
         <span className="text-[9px] leading-tight font-medium text-center px-0.5 line-clamp-2 opacity-90">
           {misconceptionLabel}
         </span>
@@ -605,8 +713,55 @@ function HeatmapCell({
 // Sub-component: Legend
 // ─────────────────────────────────────────────────────────────────────────────
 
-function Legend({ language }: { language: 'en' | 'bm' }) {
+function Legend({
+  language,
+  colorMode,
+  clusters,
+}: {
+  language: 'en' | 'bm';
+  colorMode: ColorMode;
+  clusters: MisconceptionCluster[];
+}) {
   const t = COPY[language];
+
+  // Typology view: the legend IS the class's error-pattern breakdown, so each
+  // entry doubles as a headcount for that shared mental block.
+  if (colorMode === 'misconception') {
+    return (
+      <div className="mt-5 px-1">
+        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+          {t.errorPatterns}
+        </p>
+        {clusters.length === 0 ? (
+          <p className="text-xs text-gray-400 italic">{t.noErrorPatterns}</p>
+        ) : (
+          <div className="flex flex-wrap gap-x-5 gap-y-1.5">
+            {clusters.map((cluster, i) => (
+              <span
+                key={cluster.misconceptionId}
+                className="flex items-center gap-1.5 text-xs text-gray-600"
+              >
+                <span
+                  className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                  style={{
+                    backgroundColor:
+                      MISCONCEPTION_COLORS[i % MISCONCEPTION_COLORS.length],
+                  }}
+                />
+                {cluster.shortLabel}
+                <span className="text-gray-400">({cluster.students.length})</span>
+                {cluster.repeatAlertCount > 0 && (
+                  <span className="text-red-600 font-semibold">
+                    · {cluster.repeatAlertCount} ≥{REPEAT_ALERT_THRESHOLD}×
+                  </span>
+                )}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   const items: { color: string; label: string }[] = [
     { color: TIER_COLORS.red, label: t.legendRed },
@@ -646,16 +801,39 @@ export default function ClassGapMap({
 }: ClassGapMapProps) {
   const t = COPY[language];
   const { docs, loading } = useClassProgress(classId);
+  const { context } = useClassContext(classId);
 
   const [sortMode, setSortMode] = useState<SortMode>('priority');
+  const [colorMode, setColorMode] = useState<ColorMode>('tier');
   const [selectedStudent, setSelectedStudent] = useState<StudentRow | null>(
     null,
   );
   const [sheetOpen, setSheetOpen] = useState(false);
 
+  // Misconception clusters drive the typology palette — the most widespread
+  // error pattern gets the first colour, so the legend reads in priority order.
+  const clusters = useMemo(
+    () => clusterByMisconception(docs, context, language),
+    [docs, context, language],
+  );
+  const colorIndex = useMemo(
+    () => buildMisconceptionColorIndex(clusters),
+    [clusters],
+  );
+
+  const misconceptionColorFor = useCallback(
+    (misconceptionId: string | null): string | null => {
+      if (!misconceptionId) return null;
+      const i = colorIndex.get(misconceptionId);
+      if (i === undefined) return null;
+      return MISCONCEPTION_COLORS[i % MISCONCEPTION_COLORS.length];
+    },
+    [colorIndex],
+  );
+
   // Build & sort rows
   const rows = useMemo(() => {
-    const built = buildStudentRows(docs, topics, language);
+    const built = buildStudentRows(docs, topics, language, context);
     if (sortMode === 'priority') {
       built.sort((a, b) => b.urgencyScore - a.urgencyScore);
     } else {
@@ -664,7 +842,7 @@ export default function ClassGapMap({
       );
     }
     return built;
-  }, [docs, topics, language, sortMode]);
+  }, [docs, topics, language, sortMode, context]);
 
   const handleCellClick = useCallback((student: StudentRow) => {
     setSelectedStudent(student);
@@ -712,6 +890,36 @@ export default function ClassGapMap({
           <p className="text-xs text-gray-500 mt-0.5">{t.subtitle}</p>
         </div>
 
+        <div className="flex flex-wrap items-center gap-2">
+        {/* Colour-mode toggle — mastery tiers vs misconception typology */}
+        <div
+          className="inline-flex rounded-lg bg-gray-100 p-0.5"
+          role="radiogroup"
+          aria-label="Colour mode"
+        >
+          {(
+            [
+              { mode: 'tier' as ColorMode, label: t.tierView },
+              { mode: 'misconception' as ColorMode, label: t.misconceptionView },
+            ] as const
+          ).map(({ mode, label }) => (
+            <button
+              key={mode}
+              role="radio"
+              aria-checked={colorMode === mode}
+              onClick={() => setColorMode(mode)}
+              className={cn(
+                'px-3 py-1.5 text-xs font-medium rounded-md transition-all duration-150',
+                colorMode === mode
+                  ? 'bg-white text-gray-900 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-700',
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
         {/* Sort toggle */}
         <div
           className="inline-flex rounded-lg bg-gray-100 p-0.5"
@@ -739,6 +947,7 @@ export default function ClassGapMap({
               {label}
             </button>
           ))}
+        </div>
         </div>
       </div>
 
@@ -801,9 +1010,17 @@ export default function ClassGapMap({
                         <div className="w-full max-w-[48px] mx-auto">
                           <HeatmapCell
                             tier={tier}
+                            colorMode={colorMode}
+                            misconceptionColor={
+                              isNoData
+                                ? null
+                                : misconceptionColorFor(cell.dominantMisconceptionId)
+                            }
                             misconceptionLabel={
                               isNoData ? null : cell.misconceptionLabel
                             }
+                            occurrences={isNoData ? 0 : cell.maxOccurrences}
+                            repeatAlert={!isNoData && cell.repeatAlert}
                             persistenceHigh={
                               !isNoData && cell.maxPersistence > 3
                             }
@@ -824,7 +1041,7 @@ export default function ClassGapMap({
       </div>
 
       {/* Legend */}
-      <Legend language={language} />
+      <Legend language={language} colorMode={colorMode} clusters={clusters} />
 
       {/* Student Detail Sheet */}
       <StudentDetailSheet
@@ -832,6 +1049,7 @@ export default function ClassGapMap({
         onClose={handleSheetClose}
         student={selectedStudent}
         language={language}
+        context={context}
       />
     </section>
   );
