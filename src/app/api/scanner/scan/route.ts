@@ -5,7 +5,7 @@ import { callGemini, parseGeminiJSON } from '@/lib/gemini';
 // Config
 // ────────────────────────────────────────────────────────────────────────────
 
-/** Firebase Admin and the AI SDK both need Node APIs, not the edge runtime. */
+/** Supabase Admin and the AI SDK both need Node APIs, not the edge runtime. */
 export const runtime = 'nodejs';
 
 /** A page of answer slips can take Gemini a while; the default 10s is not enough. */

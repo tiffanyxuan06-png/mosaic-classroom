@@ -4,36 +4,34 @@
  *   npm run seed              # write to the configured project
  *   npm run seed -- --dry-run # print what would be written, touch nothing
  *
- * Rewritten from the original Prompt 0.5 version: the app's real schema has
- * moved on since then (see src/lib/helpers.ts, which is the module the live
- * ClassGapMap and ActionCard components actually read), so this version
- * builds every document to match that schema exactly rather than inventing
- * its own. Tier is never hand-picked — it is computed with the app's own
- * `calculateTier` so the seeded heatmap is guaranteed to match what the
- * dashboard would compute live from the same activeMisconceptions data.
+ * Rewritten from the original Firestore version (scripts/seedFirestore.ts) to
+ * target Supabase (Postgres + Supabase Auth) instead. The app's real schema
+ * lives in src/lib/helpers.ts (the module the live ClassGapMap and ActionCard
+ * components actually read) and supabase/schema.sql (the Postgres tables),
+ * so this version builds every row to match those exactly rather than
+ * inventing its own. Tier is never hand-picked — it is computed with the
+ * app's own `calculateTier` so the seeded heatmap is guaranteed to match what
+ * the dashboard would compute live from the same active_misconceptions data.
  *
- * Safe to re-run: every Firestore doc uses a deterministic ID and the RNG is
+ * Safe to re-run: every row uses a deterministic id/unique-key and the RNG is
  * seeded, so a second run reproduces the same demo state rather than
- * duplicating or drifting. Every Firebase Auth account is looked up by email
+ * duplicating or drifting. Every Supabase Auth account is looked up by email
  * before being created.
  *
- * Credentials come from either GOOGLE_APPLICATION_CREDENTIALS (path to a
- * service account JSON) or the FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL /
- * FIREBASE_PRIVATE_KEY triple in .env.local. Point FIRESTORE_EMULATOR_HOST and
- * FIREBASE_AUTH_EMULATOR_HOST at the emulators to seed locally.
+ * Credentials come from NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY
+ * in .env.local.
  */
 import * as fs from 'fs';
 import * as path from 'path';
 
 import * as dotenv from 'dotenv';
-import { cert, initializeApp, applicationDefault, type App } from 'firebase-admin/app';
-import { getAuth, type Auth } from 'firebase-admin/auth';
-import { FieldValue, getFirestore, type Firestore } from 'firebase-admin/firestore';
+import { createClient, type SupabaseClient, type User } from '@supabase/supabase-js';
 
 // Reuse the app's own tier/persistence logic so the seed can never drift from
-// what the live dashboard would compute for the same activeMisconceptions.
-// helpers.ts has no imports of its own, so it is safe to pull into a ts-node
-// script that never touches the browser or the Next.js runtime.
+// what the live dashboard would compute for the same active_misconceptions.
+// helpers.ts has no side-effecting imports of its own (only the Supabase JS
+// types), so it is safe to pull into a ts-node script that never touches the
+// browser or the Next.js runtime.
 import {
   calculateTier,
   calculatePersistenceScore,
@@ -66,8 +64,8 @@ const TEACHER_NAME = 'Ms. Aida';
 /** Demo-only shared password. Never ship this beyond a demo project. */
 const STUDENT_PASSWORD = 'demo1234';
 
-/** Firestore caps a write batch at 500 operations. */
-const BATCH_LIMIT = 450;
+/** Reasonable chunk size for multi-row upserts (well under any practical limit). */
+const UPSERT_CHUNK_SIZE = 200;
 
 /** Fixed seed so the class roster and heatmap look identical on every run. */
 const RANDOM_SEED = 20260905;
@@ -111,6 +109,14 @@ function classroomTimestamp(daysAgo: number): number {
   date.setDate(date.getDate() - daysAgo);
   date.setHours(randomInt(8, 15), randomInt(0, 59), randomInt(0, 59), 0);
   return date.getTime();
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -157,11 +163,12 @@ function readMisconceptionCatalog(): MisconceptionCatalogEntry[] {
 // ────────────────────────────────────────────────────────────────────────────
 // Topic-plan model — the building blocks each student is assembled from.
 //
-// A "topic plan" becomes exactly one studentProgress document, matching
-// src/lib/helpers.ts's StudentProgress interface (one doc per student per
-// topic, id `${uid}_${classId}_${topic}`). Tier is computed by calculateTier
-// from the fields below — it is never assigned directly — so seeded data can
-// never disagree with what the live app would compute for the same input.
+// A "topic plan" becomes exactly one student_progress row, matching
+// src/lib/helpers.ts's StudentProgress interface (one row per student per
+// topic, unique on student_uid/class_id/topic). Tier is computed by
+// calculateTier from the fields below — it is never assigned directly — so
+// seeded data can never disagree with what the live app would compute for
+// the same input.
 // ────────────────────────────────────────────────────────────────────────────
 
 interface ActiveMisconceptionSeed {
@@ -367,56 +374,90 @@ function buildAnswerHistory(student: StudentSeed): AnswerSeed[] {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Firebase / Firestore helpers
+// Supabase helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-function initFirebase(): { app: App; db: Firestore; auth: Auth } {
-  const { FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, GOOGLE_APPLICATION_CREDENTIALS } =
-    process.env;
+function initSupabase(): { supabase: SupabaseClient; url: string } {
+  const { NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
-  let app: App;
-
-  if (FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY) {
-    app = initializeApp({
-      credential: cert({
-        projectId: FIREBASE_PROJECT_ID,
-        clientEmail: FIREBASE_CLIENT_EMAIL,
-        privateKey: FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      }),
-      projectId: FIREBASE_PROJECT_ID,
+  if (NEXT_PUBLIC_SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+    const supabase = createClient(NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
     });
-  } else if (GOOGLE_APPLICATION_CREDENTIALS) {
-    app = initializeApp({ credential: applicationDefault() });
-  } else if (DRY_RUN) {
-    app = initializeApp({ projectId: 'mosaic-classroom-dry-run' });
-  } else {
-    throw new Error(
-      'No Firebase credentials found. Set FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY ' +
-        'in .env.local, or point GOOGLE_APPLICATION_CREDENTIALS at a service account JSON file.',
-    );
+    return { supabase, url: NEXT_PUBLIC_SUPABASE_URL };
   }
 
-  return { app, db: getFirestore(app), auth: getAuth(app) };
+  if (DRY_RUN) {
+    const url = 'https://mosaic-classroom-dry-run.supabase.co';
+    const supabase = createClient(url, 'dry-run-service-role-key', {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    return { supabase, url };
+  }
+
+  throw new Error(
+    'No Supabase credentials found. Set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY ' +
+      'in .env.local (see .env.local.example).',
+  );
 }
 
-/** Create the account, or reset the password if the email already exists. */
-async function upsertAuthUser(auth: Auth, email: string, displayName: string, password: string): Promise<string> {
+/** Page through auth.admin.listUsers() looking for a matching email. */
+async function findAuthUserByEmail(supabase: SupabaseClient, email: string): Promise<User | null> {
+  const perPage = 200;
+  for (let page = 1; page <= 20; page++) {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+
+    const match = data.users.find((u) => u.email?.toLowerCase() === email.toLowerCase());
+    if (match) return match;
+
+    if (data.users.length < perPage) break; // last page
+  }
+  return null;
+}
+
+/** Create the account, or reset the password/metadata if the email already exists. */
+async function upsertAuthUser(
+  supabase: SupabaseClient,
+  email: string,
+  displayName: string,
+  password: string,
+): Promise<string> {
   if (DRY_RUN) {
     return `dry-run-uid-${email.split('@')[0]}`;
   }
 
-  try {
-    const existing = await auth.getUserByEmail(email);
-    await auth.updateUser(existing.uid, { displayName, password, emailVerified: true });
-    return existing.uid;
-  } catch (error) {
-    if ((error as { code?: string }).code !== 'auth/user-not-found') {
-      throw error;
-    }
+  const { data: created, error: createError } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: { name: displayName },
+  });
 
-    const created = await auth.createUser({ email, password, displayName, emailVerified: true });
-    return created.uid;
+  if (!createError && created.user) {
+    return created.user.id;
   }
+
+  const alreadyExists =
+    createError &&
+    /already been registered|already exists|already registered/i.test(createError.message ?? '');
+
+  if (!alreadyExists) {
+    throw createError ?? new Error(`Failed to create auth user for ${email}`);
+  }
+
+  const existing = await findAuthUserByEmail(supabase, email);
+  if (!existing) {
+    throw createError;
+  }
+
+  const { data: updated, error: updateError } = await supabase.auth.admin.updateUserById(existing.id, {
+    password,
+    user_metadata: { name: displayName },
+  });
+
+  if (updateError) throw updateError;
+  return updated.user?.id ?? existing.id;
 }
 
 function slugifyEmail(name: string, taken: Set<string>): string {
@@ -443,17 +484,23 @@ function slugifyEmail(name: string, taken: Set<string>): string {
   return candidate;
 }
 
-type PendingWrite = { ref: FirebaseFirestore.DocumentReference; data: FirebaseFirestore.DocumentData };
+/** Upsert `rows` into `table` in chunks, skipping entirely in dry-run mode. */
+async function upsertChunked(
+  supabase: SupabaseClient,
+  table: string,
+  rows: Record<string, unknown>[],
+  onConflict?: string,
+): Promise<void> {
+  if (DRY_RUN || rows.length === 0) return;
 
-async function commitAll(db: Firestore, writes: PendingWrite[]): Promise<void> {
-  if (DRY_RUN) return;
+  for (const batch of chunk(rows, UPSERT_CHUNK_SIZE)) {
+    const { error } = onConflict
+      ? await supabase.from(table).upsert(batch, { onConflict })
+      : await supabase.from(table).upsert(batch);
 
-  for (let i = 0; i < writes.length; i += BATCH_LIMIT) {
-    const batch = db.batch();
-    for (const { ref, data } of writes.slice(i, i + BATCH_LIMIT)) {
-      batch.set(ref, data);
+    if (error) {
+      throw new Error(`Failed to upsert into "${table}": ${error.message}`);
     }
-    await batch.commit();
   }
 }
 
@@ -495,80 +542,89 @@ function buildActiveMisconception(
 async function seed(): Promise<void> {
   const catalog = readMisconceptionCatalog();
   const catalogById = new Map(catalog.map((entry) => [entry.misconceptionId, entry]));
-  const { db, auth } = initFirebase();
-  const projectId = process.env.FIREBASE_PROJECT_ID ?? process.env.GCLOUD_PROJECT ?? '(from credentials)';
+  const { supabase, url } = initSupabase();
+  const nowIso = new Date().toISOString();
 
   console.log(`\nMosaic Classroom demo seed${DRY_RUN ? ' (dry run — nothing will be written)' : ''}`);
-  console.log(`  project:  ${projectId}`);
-  console.log(`  emulator: ${process.env.FIRESTORE_EMULATOR_HOST ?? 'no (writing to the live project)'}`);
+  console.log(`  project:  ${url}`);
   console.log(`  data:     ${catalog.length} misconceptions, ${STUDENTS.length} students + 1 kiosk-only student\n`);
 
-  const writes: PendingWrite[] = [];
-  const now = FieldValue.serverTimestamp();
-
-  // 1. Misconception catalogue, keyed by misconceptionId.
-  for (const entry of catalog) {
-    writes.push({ ref: db.collection('misconceptions').doc(entry.misconceptionId), data: { ...entry, updatedAt: now } });
-  }
-  console.log(`  [1/6] queued ${catalog.length} misconceptions`);
+  // 1. Misconception catalogue, keyed by misconceptionId (-> "id" column).
+  const misconceptionRows = catalog.map((entry) => ({
+    id: entry.misconceptionId,
+    subject: entry.subject,
+    topic: entry.topic,
+    name: entry.name,
+    name_bm: entry.name_bm,
+    wrong_answer_pattern: entry.wrong_answer_pattern,
+    plain_language_label: entry.plain_language_label,
+    plain_language_label_bm: entry.plain_language_label_bm,
+    remediation_approach: entry.remediation_approach,
+    prerequisite_misconception_id: entry.prerequisite_misconception_id,
+    severity: entry.severity,
+    updated_at: nowIso,
+  }));
+  await upsertChunked(supabase, 'misconceptions', misconceptionRows, 'id');
+  console.log(`  [1/6] ${DRY_RUN ? 'would upsert' : 'upserted'} ${catalog.length} misconceptions`);
 
   // 2. Teacher account + class.
-  const teacherUid = await upsertAuthUser(auth, TEACHER_EMAIL, TEACHER_NAME, TEACHER_PASSWORD);
-  writes.push({
-    ref: db.collection('users').doc(teacherUid),
-    data: {
-      uid: teacherUid,
-      name: TEACHER_NAME,
-      email: TEACHER_EMAIL,
-      role: 'teacher',
-      classId: CLASS_ID,
-      className: CLASS_NAME, // read by TeacherLayout's header
-      language: 'en',
-      createdAt: now,
-    },
+  const teacherUid = await upsertAuthUser(supabase, TEACHER_EMAIL, TEACHER_NAME, TEACHER_PASSWORD);
+  const profileRows: Record<string, unknown>[] = [];
+
+  profileRows.push({
+    id: teacherUid,
+    name: TEACHER_NAME,
+    email: TEACHER_EMAIL,
+    role: 'teacher',
+    class_id: CLASS_ID,
+    class_name: CLASS_NAME, // read by TeacherLayout's header
+    language: 'en',
+    kiosk_only: false,
+    created_at: nowIso,
   });
   console.log(`  [2/6] teacher ${TEACHER_EMAIL} -> ${teacherUid}`);
 
-  writes.push({
-    ref: db.collection('classes').doc(CLASS_ID),
-    data: {
-      classId: CLASS_ID,
-      teacherUid,
-      name: CLASS_NAME,
-      subject: CLASS_SUBJECT,
-      topics: CLASS_TOPICS,
-      kioskMode: false,
-      kioskCode: CLASS_KIOSK_CODE,
-      studentCount: STUDENTS.length,
-      createdAt: now,
-    },
-  });
-  console.log(`  [3/6] class ${CLASS_ID} (${CLASS_NAME}), kiosk code ${CLASS_KIOSK_CODE}`);
+  // NOTE: this row references profileRows[0] (the teacher) via a foreign
+  // key, so it can't be written until that profile row exists — it's queued
+  // here but not upserted until after `profiles` is written below.
+  const classRow = {
+    id: CLASS_ID,
+    teacher_id: teacherUid,
+    name: CLASS_NAME,
+    subject: CLASS_SUBJECT,
+    topics: CLASS_TOPICS,
+    kiosk_mode: false,
+    kiosk_code: CLASS_KIOSK_CODE,
+    student_count: STUDENTS.length,
+    created_at: nowIso,
+  };
+  console.log(`  [3/6] queued class ${CLASS_ID} (${CLASS_NAME}), kiosk code ${CLASS_KIOSK_CODE}`);
 
-  // 3. Students: auth account, users doc, one studentProgress doc per topic,
-  //    and 5-15 historical answers.
-  const takenEmails = new Set<string>();
+  // 3. Students: auth account, profile row, one student_progress row per
+  //    topic, and 5-15 historical answers.
+  const takenEmails = new Set<string>([TEACHER_EMAIL]);
   const tierTally: Record<Group, number> = { red: 0, yellow: 0, green: 0, blue: 0 };
   const misconceptionTally = new Map<string, Set<string>>();
+  const studentProgressRows: Record<string, unknown>[] = [];
+  const answerRows: Record<string, unknown>[] = [];
   let totalProgressDocs = 0;
   let totalAnswers = 0;
 
   for (const student of STUDENTS) {
     const email = slugifyEmail(student.name, takenEmails);
-    const uid = await upsertAuthUser(auth, email, student.name, STUDENT_PASSWORD);
+    const uid = await upsertAuthUser(supabase, email, student.name, STUDENT_PASSWORD);
     tierTally[student.group] += 1;
 
-    writes.push({
-      ref: db.collection('users').doc(uid),
-      data: {
-        uid,
-        name: student.name,
-        email,
-        role: 'student',
-        classId: CLASS_ID,
-        language: student.language,
-        createdAt: now,
-      },
+    profileRows.push({
+      id: uid,
+      name: student.name,
+      email,
+      role: 'student',
+      class_id: CLASS_ID,
+      class_name: null,
+      language: student.language,
+      kiosk_only: false,
+      created_at: nowIso,
     });
 
     const observedTiers: StudentTier[] = [];
@@ -590,9 +646,17 @@ async function seed(): Promise<void> {
       progress.tier = calculateTier(progress);
       observedTiers.push(progress.tier);
 
-      writes.push({
-        ref: db.collection('studentProgress').doc(`${uid}_${CLASS_ID}_${topicPlan.topic}`),
-        data: { ...progress, updatedAt: now },
+      studentProgressRows.push({
+        student_uid: progress.studentUid,
+        class_id: progress.classId,
+        topic: progress.topic,
+        tier: progress.tier,
+        active_misconceptions: progress.activeMisconceptions,
+        mastery_score: progress.masteryScore,
+        consecutive_correct: progress.consecutiveCorrect,
+        transfer_passed: progress.transferPassed,
+        sessions_active: progress.sessionsActive ?? 1,
+        last_updated: nowIso,
       });
       totalProgressDocs += 1;
 
@@ -616,18 +680,16 @@ async function seed(): Promise<void> {
 
     const answers = buildAnswerHistory(student);
     answers.forEach((answer, index) => {
-      writes.push({
-        ref: db.collection('answers').doc(`${uid}_${index + 1}`),
-        data: {
-          studentUid: uid,
-          classId: CLASS_ID,
-          topic: answer.topic,
-          isCorrect: answer.isCorrect,
-          isTransferQuestion: answer.isTransferQuestion,
-          misconceptionId: answer.misconceptionId,
-          confidenceLevel: answer.confidenceLevel,
-          timestamp: answer.timestamp,
-        },
+      answerRows.push({
+        id: `${uid}_${index + 1}`,
+        student_uid: uid,
+        class_id: CLASS_ID,
+        topic: answer.topic,
+        is_correct: answer.isCorrect,
+        is_transfer_question: answer.isTransferQuestion,
+        misconception_id: answer.misconceptionId,
+        confidence_level: answer.confidenceLevel,
+        timestamp: new Date(answer.timestamp).toISOString(),
       });
     });
     totalAnswers += answers.length;
@@ -637,36 +699,44 @@ async function seed(): Promise<void> {
         `${student.topics.length} topic doc(s), ${answers.length} answers`,
     );
   }
-  console.log(`  [4/6] queued ${STUDENTS.length} students — ${totalProgressDocs} progress docs, ${totalAnswers} answers`);
+  console.log(`  [4/6] queued ${STUDENTS.length} students — ${totalProgressDocs} progress rows, ${totalAnswers} answers`);
 
   // 4. Priya — kiosk demo student.
   //
   // The kiosk flow (src/app/kiosk/[classId]/page.tsx) picks students from
-  // `users` where classId + role == 'student', and derives its own progress
-  // document id from a slug of the *name* (`kiosk_${classId}_${slug}`), not
-  // from this doc's id or from the helpers.ts schema every other student
-  // above uses. So Priya only needs a roster entry here — no Firebase Auth
-  // account (the kiosk flow never signs her in individually) and no
-  // pre-seeded progress (the kiosk page creates a fresh one on first use,
-  // which is arguably the better live demo: it shows the cold-start flow).
-  // She is intentionally NOT counted in the "20 total" tally above.
-  const priyaId = `kiosk_roster_${CLASS_ID}_priya`;
-  writes.push({
-    ref: db.collection('users').doc(priyaId),
-    data: {
-      uid: priyaId,
-      name: 'Priya',
-      role: 'student',
-      classId: CLASS_ID,
-      language: 'en',
-      kioskOnly: true,
-      createdAt: now,
-    },
+  // `profiles` where class_id + role == 'student', and derives its own
+  // progress row from a slug of the *name*, not from the helpers.ts schema
+  // every other student above uses. So Priya only needs a roster entry here
+  // — no pre-seeded progress (the kiosk page creates a fresh one on first
+  // use, which is arguably the better live demo: it shows the cold-start
+  // flow). She is intentionally NOT counted in the "20 total" tally above.
+  //
+  // Unlike the old Firestore version, `profiles.id` carries a foreign key to
+  // `auth.users(id)`, so Priya still needs a real (if unused) Supabase Auth
+  // account to keep referential integrity — the kiosk flow never signs her
+  // in individually, so her password is never used.
+  const priyaEmail = slugifyEmail('Priya (kiosk)', takenEmails);
+  const priyaUid = await upsertAuthUser(supabase, priyaEmail, 'Priya', STUDENT_PASSWORD);
+  profileRows.push({
+    id: priyaUid,
+    name: 'Priya',
+    email: priyaEmail,
+    role: 'student',
+    class_id: CLASS_ID,
+    class_name: null,
+    language: 'en',
+    kiosk_only: true,
+    created_at: nowIso,
   });
   console.log(`  [5/6] queued kiosk-only roster entry for Priya (not counted in the 20)`);
 
-  await commitAll(db, writes);
-  console.log(`  [6/6] ${DRY_RUN ? 'would write' : 'wrote'} ${writes.length} documents\n`);
+  await upsertChunked(supabase, 'profiles', profileRows, 'id');
+  await upsertChunked(supabase, 'classes', [classRow], 'id');
+  await upsertChunked(supabase, 'student_progress', studentProgressRows, 'student_uid,class_id,topic');
+  await upsertChunked(supabase, 'answers', answerRows, 'id');
+
+  const totalRows = misconceptionRows.length + profileRows.length + 1 + studentProgressRows.length + answerRows.length;
+  console.log(`  [6/6] ${DRY_RUN ? 'would write' : 'wrote'} ${totalRows} rows\n`);
 
   // ── Summary ────────────────────────────────────────────────────────────
   console.log('─'.repeat(72));

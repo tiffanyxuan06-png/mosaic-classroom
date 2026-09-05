@@ -1,7 +1,5 @@
 import 'dotenv/config';
-import { cert, getApps, initializeApp } from 'firebase-admin/app';
-import { getAuth } from 'firebase-admin/auth';
-import { getFirestore } from 'firebase-admin/firestore';
+import { createClient } from '@supabase/supabase-js';
 
 const baseUrl = (process.env.BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '');
 const classId = 'class_demo_01';
@@ -21,49 +19,50 @@ async function timedFetch(path: string, init?: RequestInit) {
 }
 
 function adminDb() {
-  if (!getApps().length) {
-    const { FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY } = process.env;
-    if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
-      throw new Error('Missing FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, or FIREBASE_PRIVATE_KEY.');
-    }
-    initializeApp({ credential: cert({ projectId: FIREBASE_PROJECT_ID, clientEmail: FIREBASE_CLIENT_EMAIL, privateKey: FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') }) });
+  const { NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+  if (!NEXT_PUBLIC_SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.');
   }
-  return getFirestore();
+  return createClient(NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
 }
 
 async function run() {
   console.log(`Golden-path target: ${baseUrl}`);
-  let db: ReturnType<typeof getFirestore>;
+  let db: ReturnType<typeof adminDb>;
   try { db = adminDb(); } catch (error) { console.error(String(error)); process.exitCode = 1; return; }
 
   // 1. Teacher authentication and dashboard reachability.
   try {
-    const user = await getAuth().getUserByEmail(teacherEmail);
+    const { data: users } = await db.auth.admin.listUsers();
+    const user = users?.users.find((u) => u.email === teacherEmail);
     const dashboard = await timedFetch('/teacher');
-    record('1 Teacher login', Boolean(user.uid) && dashboard.response.ok, `teacher account found; /teacher returned ${dashboard.response.status}`, dashboard.ms);
+    record('1 Teacher login', Boolean(user?.id) && dashboard.response.ok, `teacher account found; /teacher returned ${dashboard.response.status}`, dashboard.ms);
   } catch (error) { record('1 Teacher login', false, String(error)); }
 
   // 2. Action Card source data is present in the seeded class.
   try {
-    const progress = await db.collection('studentProgress').where('classId', '==', classId).get();
-    const active = progress.docs.flatMap((doc) => (doc.data().activeMisconceptions ?? []).filter((m: { isCleared?: boolean }) => !m.isCleared));
+    const { data: progress } = await db.from('student_progress').select('*').eq('class_id', classId);
+    const active = (progress ?? []).flatMap((row) => (row.active_misconceptions ?? []).filter((m: { isCleared?: boolean }) => !m.isCleared));
     record('2 ActionCard content', active.length > 0, `${active.length} active misconception records available for ActionCard generation`);
   } catch (error) { record('2 ActionCard content', false, String(error)); }
 
   // 3. Heatmap population checks.
   try {
-    const progress = await db.collection('studentProgress').where('classId', '==', classId).get();
-    const tiers = new Set(progress.docs.map((doc) => doc.data().tier).filter(Boolean));
-    const persistent = progress.docs.some((doc) => (doc.data().activeMisconceptions ?? []).some((m: { persistenceScore?: number }) => (m.persistenceScore ?? 0) > 3));
-    record('3 Heatmap population', progress.size >= 15 && tiers.size >= 3 && persistent, `${progress.size} students, ${tiers.size} tiers, persistence flag=${persistent}`);
+    const { data: progress } = await db.from('student_progress').select('*').eq('class_id', classId);
+    const rows = progress ?? [];
+    const tiers = new Set(rows.map((row) => row.tier).filter(Boolean));
+    const persistent = rows.some((row) => (row.active_misconceptions ?? []).some((m: { persistenceScore?: number }) => (m.persistenceScore ?? 0) > 3));
+    record('3 Heatmap population', rows.length >= 15 && tiers.size >= 3 && persistent, `${rows.length} students, ${tiers.size} tiers, persistence flag=${persistent}`);
   } catch (error) { record('3 Heatmap population', false, String(error)); }
 
   // 4 and 5. Kiosk state and roster route.
   try {
-    const classRef = db.collection('classes').doc(classId);
-    await classRef.set({ kioskMode: true }, { merge: true });
+    await db.from('classes').update({ kiosk_mode: true }).eq('id', classId);
     const kiosk = await timedFetch(`/kiosk/${classId}`);
-    record('4 Kiosk Mode activation', (await classRef.get()).data()?.kioskMode === true, 'class kioskMode updated');
+    const { data: updatedClass } = await db.from('classes').select('kiosk_mode').eq('id', classId).maybeSingle();
+    record('4 Kiosk Mode activation', updatedClass?.kiosk_mode === true, 'class kiosk_mode updated');
     record('5 Kiosk login as Hana', kiosk.response.ok, `/kiosk/${classId} returned ${kiosk.response.status}`, kiosk.ms);
   } catch (error) { record('4 Kiosk Mode activation', false, String(error)); record('5 Kiosk login as Hana', false, String(error)); }
 

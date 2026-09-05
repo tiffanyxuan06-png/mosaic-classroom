@@ -2,14 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { getApps, initializeApp } from 'firebase/app';
-import {
-  collection,
-  getFirestore,
-  onSnapshot,
-  query,
-  where,
-} from 'firebase/firestore';
+
+import { supabase } from '@/lib/supabase-client';
 
 export interface ActionCardProps {
   classId: string;
@@ -52,21 +46,13 @@ const ALL_CLEAR_CARD: GeneratedActionCard = {
   affectedStudentCount: 0,
 };
 
-function getClientDb() {
-  const config = {
-    apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-    authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
-    projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-    storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
-    messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
-    appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+function rowToProgressSnapshot(row: Record<string, unknown>): StudentProgressSnapshot {
+  return {
+    studentUid: row.student_uid as string | undefined,
+    activeMisconceptions: Array.isArray(row.active_misconceptions)
+      ? (row.active_misconceptions as ActiveMisconception[])
+      : [],
   };
-
-  if (!config.projectId || !config.apiKey || !config.appId) {
-    throw new Error('Firebase client configuration is incomplete.');
-  }
-
-  return getFirestore(getApps()[0] ?? initializeApp(config));
 }
 
 export function aggregateTopMisconceptions(
@@ -146,69 +132,102 @@ export default function ActionCard({
 
   useEffect(() => {
     let isCurrent = true;
-    let unsubscribe: (() => void) | undefined;
 
-    try {
-      const db = getClientDb();
-      const progressQuery = query(
-        collection(db, 'studentProgress'),
-        where('classId', '==', classId),
+    async function handleRows(rows: Record<string, unknown>[]) {
+      const topMisconceptions = aggregateTopMisconceptions(
+        rows.map(rowToProgressSnapshot),
+      );
+      const payload = {
+        classId,
+        classSize,
+        subject,
+        topic,
+        topMisconceptions,
+      };
+      const payloadKey = JSON.stringify(payload);
+
+      setHasPersistenceFlag(
+        topMisconceptions.some((misconception) => misconception.persistenceScore > 3),
       );
 
-      unsubscribe = onSnapshot(progressQuery, async (snapshot) => {
-        const topMisconceptions = aggregateTopMisconceptions(
-          snapshot.docs.map((document) => document.data() as StudentProgressSnapshot),
-        );
-        const payload = {
-          classId,
-          classSize,
-          subject,
-          topic,
-          topMisconceptions,
-        };
-        const payloadKey = JSON.stringify(payload);
+      if (topMisconceptions.length === 0) {
+        previousPayload.current = payloadKey;
+        if (isCurrent) setCard(ALL_CLEAR_CARD);
+        return;
+      }
 
-        setHasPersistenceFlag(
-          topMisconceptions.some((misconception) => misconception.persistenceScore > 3),
-        );
+      if (previousPayload.current === payloadKey) return;
+      previousPayload.current = payloadKey;
 
-        if (topMisconceptions.length === 0) {
-          previousPayload.current = payloadKey;
-          if (isCurrent) setCard(ALL_CLEAR_CARD);
+      try {
+        const response = await fetch('/api/action-card/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) throw new Error('Unable to generate action card.');
+        const nextCard = (await response.json()) as GeneratedActionCard;
+        if (isCurrent) setCard(nextCard);
+      } catch {
+        if (isCurrent) {
+          setCard({
+            urgentSummary: `${topMisconceptions[0].studentCount} student(s) need support with ${topMisconceptions[0].misconceptionName}.`,
+            suggestedActivity: 'Run a brief worked-example activity, then check each student with one follow-up question.',
+            pushPulseCheck: false,
+            affectedStudentCount: topMisconceptions[0].studentCount,
+          });
+        }
+      }
+    }
+
+    // Initial one-shot fetch — Supabase realtime doesn't emit the current
+    // rows on subscribe, unlike Firestore's onSnapshot.
+    let rowsByKey = new Map<string, Record<string, unknown>>();
+
+    supabase
+      .from('student_progress')
+      .select('*')
+      .eq('class_id', classId)
+      .then(({ data, error }) => {
+        if (!isCurrent) return;
+        if (error) {
+          console.error('[ActionCard] Error loading student progress:', error);
+          setCard(ALL_CLEAR_CARD);
           return;
         }
-
-        if (previousPayload.current === payloadKey) return;
-        previousPayload.current = payloadKey;
-
-        try {
-          const response = await fetch('/api/action-card/generate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-
-          if (!response.ok) throw new Error('Unable to generate action card.');
-          const nextCard = (await response.json()) as GeneratedActionCard;
-          if (isCurrent) setCard(nextCard);
-        } catch {
-          if (isCurrent) {
-            setCard({
-              urgentSummary: `${topMisconceptions[0].studentCount} student(s) need support with ${topMisconceptions[0].misconceptionName}.`,
-              suggestedActivity: 'Run a brief worked-example activity, then check each student with one follow-up question.',
-              pushPulseCheck: false,
-              affectedStudentCount: topMisconceptions[0].studentCount,
-            });
-          }
-        }
+        rowsByKey = new Map(
+          (data ?? []).map((row) => [`${row.student_uid}::${row.topic}`, row]),
+        );
+        void handleRows(Array.from(rowsByKey.values()));
       });
-    } catch {
-      setCard(ALL_CLEAR_CARD);
-    }
+
+    const channel = supabase
+      .channel(`action-card-${classId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'student_progress',
+          filter: `class_id=eq.${classId}`,
+        },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldRow = payload.old as Record<string, unknown>;
+            rowsByKey.delete(`${oldRow.student_uid}::${oldRow.topic}`);
+          } else {
+            const newRow = payload.new as Record<string, unknown>;
+            rowsByKey.set(`${newRow.student_uid}::${newRow.topic}`, newRow);
+          }
+          void handleRows(Array.from(rowsByKey.values()));
+        },
+      )
+      .subscribe();
 
     return () => {
       isCurrent = false;
-      unsubscribe?.();
+      supabase.removeChannel(channel);
     };
   }, [classId, classSize, subject, topic]);
 

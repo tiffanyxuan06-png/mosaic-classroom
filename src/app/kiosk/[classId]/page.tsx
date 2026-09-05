@@ -1,28 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  addDoc,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  query,
-  serverTimestamp,
-  where,
-} from "firebase/firestore";
 
-import { db } from "@/lib/firebase-client";
+import { supabase } from "@/lib/supabase-client";
 import QuizQuestion, { type QuizQuestionData } from "@/components/QuizQuestion";
 import FeedbackCard from "@/components/FeedbackCard";
 import {
-  updateStudentProgress,
   getNextQuestionParams,
-  makeDefaultProgress,
+  type Answer,
+  type ConfidenceLevel,
   type StudentProgress,
-  type MasteryTier,
-  type AnswerPayload,
-} from "@/lib/studentProgress";
+  type StudentTier,
+} from "@/lib/helpers";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -33,11 +22,16 @@ const COMPLETE_AUTO_ADVANCE_MS = 6000;
 
 type Phase = "selection" | "quiz" | "complete" | "error";
 type QuizStep = "question" | "feedback";
-type ConfidenceLevel = "guessed" | "unsure" | "knew";
 
 interface RosterStudent {
   id: string;
   name: string;
+}
+
+interface ClassInfo {
+  id: string;
+  subject: string;
+  topics: string[];
 }
 
 interface AnswerState {
@@ -48,7 +42,7 @@ interface AnswerState {
   confidenceLevel: ConfidenceLevel;
 }
 
-const TIER_COLORS: Record<MasteryTier, string> = {
+const TIER_COLORS: Record<StudentTier, string> = {
   red: "bg-red-500",
   yellow: "bg-yellow-400",
   green: "bg-green-500",
@@ -58,11 +52,42 @@ const TIER_COLORS: Record<MasteryTier, string> = {
 /**
  * Kiosk sessions have no auth uid, so progress is keyed by a name+class slug
  * instead — scoped per class to avoid collisions between same-named students
- * in different classes.
+ * in different classes. Progress for this synthetic id is only ever read or
+ * written through the shared service-role /api/progress route (see that
+ * route's header comment for why).
  */
 function kioskStudentId(classId: string, studentName: string): string {
   const slug = studentName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
   return `kiosk_${classId}_${slug}`;
+}
+
+function defaultProgress(studentUid: string, classId: string, topic: string): StudentProgress {
+  return {
+    studentUid,
+    classId,
+    topic,
+    tier: "red",
+    activeMisconceptions: [],
+    masteryScore: 0,
+    consecutiveCorrect: 0,
+    transferPassed: false,
+    sessionsActive: 1,
+  };
+}
+
+async function fetchMisconceptionLabels(
+  misconceptionId: string,
+): Promise<{ en: string | null; bm: string | null }> {
+  const { data } = await supabase
+    .from("misconceptions")
+    .select("plain_language_label, plain_language_label_bm")
+    .eq("id", misconceptionId)
+    .maybeSingle();
+
+  return {
+    en: (data?.plain_language_label as string | undefined) ?? null,
+    bm: (data?.plain_language_label_bm as string | undefined) ?? null,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,6 +102,7 @@ export default function KioskSessionPage({
   const { classId } = params;
 
   const [phase, setPhase] = useState<Phase>("selection");
+  const [classInfo, setClassInfo] = useState<ClassInfo | null>(null);
   const [roster, setRoster] = useState<RosterStudent[]>([]);
   const [rosterLoading, setRosterLoading] = useState(true);
 
@@ -90,36 +116,30 @@ export default function KioskSessionPage({
   const [questionsAnswered, setQuestionsAnswered] = useState(0);
 
   const consecutiveCorrectRef = useRef(0);
-  const lastWasTransferRef = useRef(false);
-  const recentQuestionsRef = useRef<string[]>([]);
+  const sessionHistoryRef = useRef<Answer[]>([]);
+
+  const subject = classInfo?.subject ?? "mathematics";
+  const topic = classInfo?.topics?.[0] ?? "fractions";
 
   // ── Load class + roster ────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
 
-    async function loadRoster() {
+    async function loadClassAndRoster() {
       setRosterLoading(true);
       try {
-        const classSnap = await getDoc(doc(db, "classes", classId));
-        if (!classSnap.exists()) {
+        const res = await fetch(`/api/kiosk/session?classId=${encodeURIComponent(classId)}`);
+        if (!res.ok) {
           if (!cancelled) setPhase("error");
           return;
         }
 
-        const usersRef = collection(db, "users");
-        const rosterQuery = query(
-          usersRef,
-          where("classId", "==", classId),
-          where("role", "==", "student")
-        );
-        const snap = await getDocs(rosterQuery);
+        const data: { classInfo: ClassInfo; roster: RosterStudent[] } = await res.json();
 
-        const students: RosterStudent[] = snap.docs
-          .map((d) => ({ id: d.id, name: (d.data().name as string) ?? "" }))
-          .filter((s) => s.name.length > 0)
-          .sort((a, b) => a.name.localeCompare(b.name));
-
-        if (!cancelled) setRoster(students);
+        if (!cancelled) {
+          setClassInfo(data.classInfo);
+          setRoster(data.roster);
+        }
       } catch (err) {
         console.error("[kiosk] roster load error", err);
         if (!cancelled) setPhase("error");
@@ -128,56 +148,60 @@ export default function KioskSessionPage({
       }
     }
 
-    loadRoster();
+    loadClassAndRoster();
     return () => {
       cancelled = true;
     };
   }, [classId]);
 
   // ── Fetch next question ────────────────────────────────────────────────
-  const fetchQuestion = useCallback(async (currentProgress: StudentProgress) => {
-    setQuestionLoading(true);
-    try {
-      const nextParams = getNextQuestionParams(
-        currentProgress,
-        consecutiveCorrectRef.current > 0,
-        lastWasTransferRef.current,
-        consecutiveCorrectRef.current,
-        recentQuestionsRef.current
-      );
+  const fetchQuestion = useCallback(
+    async (currentProgress: StudentProgress) => {
+      setQuestionLoading(true);
+      try {
+        const nextParams = getNextQuestionParams(currentProgress, sessionHistoryRef.current);
 
-      const res = await fetch("/api/quiz/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ...nextParams,
-          previousQuestionTexts: recentQuestionsRef.current.slice(-5),
-        }),
-      });
+        let activeMisconceptionDescription: string | null = null;
+        if (nextParams.misconceptionId) {
+          const labels = await fetchMisconceptionLabels(nextParams.misconceptionId);
+          activeMisconceptionDescription = labels.en;
+        }
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: QuizQuestionData = await res.json();
+        const res = await fetch("/api/quiz/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            subject,
+            topic: currentProgress.topic,
+            difficulty: nextParams.difficulty,
+            activeMisconceptionId: nextParams.misconceptionId,
+            activeMisconceptionDescription,
+            previousQuestionTexts: [],
+            isTransferQuestion: nextParams.isTransferQuestion,
+            isResetQuestion: nextParams.isResetQuestion,
+          }),
+        });
 
-      setQuestion(data);
-      recentQuestionsRef.current = [
-        ...recentQuestionsRef.current.slice(-9),
-        data.questionText,
-      ];
-    } catch (err) {
-      console.error("[kiosk] fetchQuestion error", err);
-      setPhase("error");
-    } finally {
-      setQuestionLoading(false);
-    }
-  }, []);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data: QuizQuestionData = await res.json();
+
+        setQuestion(data);
+      } catch (err) {
+        console.error("[kiosk] fetchQuestion error", err);
+        setPhase("error");
+      } finally {
+        setQuestionLoading(false);
+      }
+    },
+    [subject],
+  );
 
   // ── Select student → start quiz session ────────────────────────────────
   const handleSelectStudent = useCallback(
     async (student: RosterStudent) => {
       setSelectedStudent(student);
       consecutiveCorrectRef.current = 0;
-      lastWasTransferRef.current = false;
-      recentQuestionsRef.current = [];
+      sessionHistoryRef.current = [];
       setQuestionsAnswered(0);
       setQuizStep("question");
       setAnswerState(null);
@@ -185,10 +209,15 @@ export default function KioskSessionPage({
       const studentId = kioskStudentId(classId, student.name);
 
       try {
-        const snap = await getDoc(doc(db, "studentProgress", studentId));
-        const initialProgress = snap.exists()
-          ? (snap.data() as StudentProgress)
-          : makeDefaultProgress(studentId, classId);
+        const res = await fetch(
+          `/api/progress?studentId=${encodeURIComponent(studentId)}&classId=${encodeURIComponent(
+            classId,
+          )}&topic=${encodeURIComponent(topic)}`,
+        );
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data: { progress: StudentProgress } = await res.json();
+        const initialProgress = data.progress ?? defaultProgress(studentId, classId, topic);
 
         setProgress(initialProgress);
         setPhase("quiz");
@@ -198,16 +227,12 @@ export default function KioskSessionPage({
         setPhase("error");
       }
     },
-    [classId, fetchQuestion]
+    [classId, topic, fetchQuestion],
   );
 
   // ── Classify misconception ──────────────────────────────────────────────
   const classifyMisconception = useCallback(
-    async (
-      q: QuizQuestionData,
-      selectedOption: string,
-      currentProgress: StudentProgress
-    ) => {
+    async (q: QuizQuestionData, selectedOption: string, currentProgress: StudentProgress) => {
       try {
         const res = await fetch("/api/quiz/classify", {
           method: "POST",
@@ -216,31 +241,30 @@ export default function KioskSessionPage({
             questionText: q.questionText,
             correctAnswer: q.options[q.correctOption as keyof typeof q.options],
             studentAnswer: q.options[selectedOption as keyof typeof q.options],
-            subject: currentProgress.subject,
-            topic: currentProgress.currentTopic,
+            subject,
+            topic: currentProgress.topic,
           }),
         });
 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
+        const labels = await fetchMisconceptionLabels(data.misconceptionId as string);
 
-        const topicProg = currentProgress.topics[currentProgress.currentTopic];
         return {
           misconceptionId: data.misconceptionId as string,
-          label: topicProg?.activeMisconceptionLabel ?? data.reasoning,
-          label_bm: topicProg?.activeMisconceptionLabel_bm ?? data.reasoning,
+          label: labels.en ?? (data.reasoning as string),
+          label_bm: labels.bm ?? (data.reasoning as string),
         };
       } catch {
-        const topicProg = currentProgress.topics[currentProgress.currentTopic];
+        const active = currentProgress.activeMisconceptions.find((m) => !m.isCleared);
         return {
-          misconceptionId: topicProg?.activeMisconceptionId ?? "unknown",
-          label: topicProg?.activeMisconceptionLabel ?? "Review this concept carefully.",
-          label_bm:
-            topicProg?.activeMisconceptionLabel_bm ?? "Semak konsep ini dengan teliti.",
+          misconceptionId: active?.misconceptionId ?? "unknown",
+          label: "Review this concept carefully.",
+          label_bm: "Semak konsep ini dengan teliti.",
         };
       }
     },
-    []
+    [subject],
   );
 
   // ── Submit answer ────────────────────────────────────────────────────────
@@ -249,18 +273,17 @@ export default function KioskSessionPage({
       selectedOption: string,
       confidenceLevel: ConfidenceLevel,
       timeSpentMs: number,
-      answerChanges: number
+      answerChanges: number,
     ) => {
       if (!question || !progress || !selectedStudent) return;
 
       const isCorrect = selectedOption === question.correctOption;
+      const isTransferQuestion = question.isTransferQuestion;
 
       if (isCorrect) {
         consecutiveCorrectRef.current += 1;
-        lastWasTransferRef.current = question.isTransferQuestion;
       } else {
         consecutiveCorrectRef.current = 0;
-        lastWasTransferRef.current = false;
       }
 
       let misconceptionId: string | null = null;
@@ -284,53 +307,69 @@ export default function KioskSessionPage({
 
       const studentId = kioskStudentId(classId, selectedStudent.name);
 
+      sessionHistoryRef.current = [
+        ...sessionHistoryRef.current,
+        {
+          studentUid: studentId,
+          classId,
+          topic: progress.topic,
+          isCorrect,
+          isTransferQuestion,
+          misconceptionId,
+          confidenceLevel,
+        },
+      ];
+
       // Raw kiosk answer log — separate from the progress document
       try {
-        await addDoc(collection(db, "kioskAnswers"), {
-          classId,
-          studentName: selectedStudent.name,
-          isKioskSession: true,
-          questionId: question.questionId,
-          questionText: question.questionText,
-          selectedOption,
-          correctOption: question.correctOption,
-          isCorrect,
-          confidenceLevel,
-          timeSpentMs,
-          answerChanges,
-          misconceptionId,
-          topic: progress.currentTopic,
-          createdAt: serverTimestamp(),
+        await fetch("/api/kiosk/answer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            classId,
+            studentName: selectedStudent.name,
+            questionId: question.questionId,
+            questionText: question.questionText,
+            selectedOption,
+            correctOption: question.correctOption,
+            isCorrect,
+            confidenceLevel,
+            timeSpentMs,
+            answerChanges,
+            misconceptionId,
+            topic: progress.topic,
+          }),
         });
       } catch (err) {
         console.error("[kiosk] answer log error", err);
       }
 
-      const payload: AnswerPayload = {
-        studentId,
-        classId,
-        topic: progress.currentTopic,
-        isCorrect,
-        isTransferQuestion: question.isTransferQuestion,
-        isResetQuestion: question.isResetQuestion,
-        confidenceLevel,
-        misconceptionId,
-        misconceptionLabel,
-        misconceptionLabel_bm,
-        timeSpentMs,
-        answerChanges,
-      };
-
       try {
-        const updated = await updateStudentProgress(payload);
-        setProgress(updated);
+        const res = await fetch("/api/progress", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            studentId,
+            classId,
+            topic: progress.topic,
+            isCorrect,
+            isTransferQuestion,
+            misconceptionId,
+            confidenceLevel,
+          }),
+        });
+
+        if (res.ok) {
+          const data: { progress: StudentProgress } = await res.json();
+          setProgress(data.progress);
+        }
       } catch (err) {
         console.error("[kiosk] updateStudentProgress error", err);
       }
 
       setQuizStep("feedback");
     },
-    [question, progress, selectedStudent, classId, classifyMisconception]
+    [question, progress, selectedStudent, classId, classifyMisconception],
   );
 
   // ── After feedback: next question or finish session ─────────────────────
@@ -449,9 +488,7 @@ export default function KioskSessionPage({
 
   // ── Render: complete ────────────────────────────────────────────────────
   if (phase === "complete") {
-    const tier: MasteryTier = progress
-      ? progress.topics[progress.currentTopic]?.tier ?? "red"
-      : "red";
+    const tier: StudentTier = progress?.tier ?? "red";
 
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-muted/40 p-6 text-center">

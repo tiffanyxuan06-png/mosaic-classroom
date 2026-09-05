@@ -1,15 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import {
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  signOut,
-  type User,
-} from "firebase/auth";
-import { doc, getDoc } from "firebase/firestore";
+import type { User } from "@supabase/supabase-js";
 
-import { auth, db } from "@/lib/firebase-client";
+import { supabase } from "@/lib/supabase-client";
 
 export type UserRole = "teacher" | "student" | null;
 
@@ -22,30 +16,45 @@ export async function signInUser(
   email: string,
   password: string
 ): Promise<AuthedUser> {
-  const credential = await signInWithEmailAndPassword(auth, email, password);
-  const uid = credential.user.uid;
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
+  if (error) throw error;
 
-  const userSnap = await getDoc(doc(db, "users", uid));
-  if (!userSnap.exists()) {
+  const uid = data.user.id;
+
+  const { data: profile, error: profileError } = await supabase
+    .from("profiles")
+    .select("role")
+    .eq("id", uid)
+    .single();
+
+  if (profileError || !profile) {
     throw new Error("No user profile found for this account.");
   }
 
-  const role = (userSnap.data().role as UserRole) ?? null;
+  const role = (profile.role as UserRole) ?? null;
   return { uid, role };
 }
 
 export async function signOutUser(): Promise<void> {
-  await signOut(auth);
+  await supabase.auth.signOut();
 }
 
 export function onAuthChange(
   callback: (user: User | null) => void
 ): () => void {
-  if (!auth || typeof auth.onAuthStateChanged !== "function") {
+  if (!supabase || typeof supabase.auth?.onAuthStateChange !== "function") {
     callback(null);
     return () => {};
   }
-  return onAuthStateChanged(auth, callback);
+
+  const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+    callback(session?.user ?? null);
+  });
+
+  return () => data.subscription.unsubscribe();
 }
 
 interface UseUserRoleResult {
@@ -72,11 +81,14 @@ export function useUserRole(): UseUserRoleResult {
         return;
       }
 
-      const userSnap = await getDoc(doc(db, "users", user.uid));
-      const data = userSnap.exists() ? userSnap.data() : null;
+      const { data } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", user.id)
+        .single();
 
       setState({
-        uid: user.uid,
+        uid: user.id,
         role: (data?.role as UserRole) ?? null,
         name: (data?.name as string) ?? null,
         profile: data,

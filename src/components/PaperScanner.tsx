@@ -1,12 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { addDoc, collection, serverTimestamp } from "firebase/firestore";
 import { Camera, Loader2, Printer, Sparkles, Upload } from "lucide-react";
 import { toast } from "sonner";
 
-import { db } from "@/lib/firebase-client";
-import { updateStudentProgress, type AnswerPayload } from "@/lib/studentProgress";
 import { cn } from "@/lib/utils";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -83,16 +80,6 @@ function fileToDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
-}
-
-/**
- * Paper scans have no auth uid, so progress is keyed by a class-scoped name
- * slug — same convention as kiosk sessions, kept simple rather than trying to
- * fuzzy-match handwritten names against the class roster.
- */
-function paperStudentId(classId: string, studentIdentifier: string): string {
-  const slug = studentIdentifier.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
-  return `paper_${classId}_${slug}`;
 }
 
 function buildPrintableSlipsHtml(questionLabels: string[]): string {
@@ -266,53 +253,33 @@ export default function PaperScanner({
     setConfirming(true);
 
     try {
-      let answersWritten = 0;
+      const scannedAnswers = results.flatMap((row) =>
+        questionLabels.map((label) => {
+          const selected = row.answers[label];
+          const correctOption = answerKey[label] || null;
+          const isCorrect = selected !== null && selected === correctOption;
 
-      await Promise.all(
-        results.map(async (row) => {
-          const studentId = paperStudentId(classId, row.studentIdentifier);
-
-          for (const label of questionLabels) {
-            const selected = row.answers[label];
-            const correctOption = answerKey[label] || null;
-            const isCorrect = selected !== null && selected === correctOption;
-
-            await addDoc(collection(db, "scannedAnswers"), {
-              classId,
-              studentIdentifier: row.studentIdentifier,
-              questionLabel: label,
-              selectedOption: selected,
-              correctOption,
-              isCorrect: selected === null ? null : isCorrect,
-              topic,
-              source: "paper_scan",
-              scannedAt: serverTimestamp(),
-            });
-
-            if (selected === null) continue;
-
-            const payload: AnswerPayload = {
-              studentId,
-              classId,
-              topic,
-              isCorrect,
-              isTransferQuestion: false,
-              isResetQuestion: false,
-              confidenceLevel: "unsure",
-              misconceptionId: null,
-              misconceptionLabel: null,
-              misconceptionLabel_bm: null,
-              timeSpentMs: 0,
-              answerChanges: 0,
-            };
-
-            await updateStudentProgress(payload);
-            answersWritten += 1;
-          }
+          return {
+            studentIdentifier: row.studentIdentifier,
+            questionLabel: label,
+            selectedOption: selected,
+            correctOption,
+            isCorrect: selected === null ? null : isCorrect,
+            topic,
+          };
         })
       );
 
-      toast.success(`${answersWritten} student answers processed`);
+      const res = await fetch("/api/scanner/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ classId, answers: scannedAnswers }),
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: { answersWritten: number } = await res.json();
+
+      toast.success(`${data.answersWritten} student answers processed`);
       onResultsProcessed(results);
       handleTryAgain();
       onClose();

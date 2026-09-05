@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
+import { supabase } from '@/lib/supabase-client';
 import type {
   StudentProgress,
   ActiveMisconception,
@@ -247,29 +248,28 @@ function buildStudentRows(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Firebase client initialisation (reusable, matches existing codebase pattern)
+// Row mapping — Postgres snake_case → the StudentProgress shape this
+// component's rendering logic expects.
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function getClientFirestore() {
-  const { initializeApp, getApps } = await import('firebase/app');
-  const { getFirestore } = await import('firebase/firestore');
-
-  const firebaseConfig = {
-    apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-    authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
-    projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+function rowToStudentProgress(row: Record<string, unknown>): StudentProgress {
+  return {
+    studentUid: row.student_uid as string,
+    classId: row.class_id as string,
+    topic: row.topic as string,
+    tier: row.tier as StudentTier,
+    activeMisconceptions: Array.isArray(row.active_misconceptions)
+      ? (row.active_misconceptions as ActiveMisconception[])
+      : [],
+    masteryScore: (row.mastery_score as number | undefined) ?? 0,
+    consecutiveCorrect: (row.consecutive_correct as number | undefined) ?? 0,
+    transferPassed: Boolean(row.transfer_passed),
+    sessionsActive: (row.sessions_active as number | undefined) ?? 1,
   };
-
-  const app =
-    getApps().length > 0
-      ? getApps()[0]
-      : initializeApp(firebaseConfig, 'client');
-
-  return getFirestore(app);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// useClassProgress — realtime subscription to studentProgress/{classId}
+// useClassProgress — realtime subscription to student_progress rows for a class
 // ─────────────────────────────────────────────────────────────────────────────
 
 function useClassProgress(classId: string) {
@@ -277,34 +277,63 @@ function useClassProgress(classId: string) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    let unsubscribe: (() => void) | null = null;
     let cancelled = false;
+    setLoading(true);
 
-    (async () => {
-      const { collection, query, where, onSnapshot } = await import(
-        'firebase/firestore'
-      );
-      const db = await getClientFirestore();
-
-      const q = query(
-        collection(db, 'studentProgress'),
-        where('classId', '==', classId),
-      );
-
-      unsubscribe = onSnapshot(q, (snapshot) => {
+    // Initial one-shot fetch — Supabase realtime doesn't emit the current
+    // rows on subscribe, unlike Firestore's onSnapshot.
+    supabase
+      .from('student_progress')
+      .select('*')
+      .eq('class_id', classId)
+      .then(({ data, error }) => {
         if (cancelled) return;
-        const results: StudentProgress[] = [];
-        snapshot.forEach((doc) => {
-          results.push(doc.data() as StudentProgress);
-        });
-        setDocs(results);
+        if (error) {
+          console.error('[ClassGapMap] Error loading student progress:', error);
+        }
+        setDocs((data ?? []).map(rowToStudentProgress));
         setLoading(false);
       });
-    })();
+
+    const channel = supabase
+      .channel(`class-gap-map-${classId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'student_progress',
+          filter: `class_id=eq.${classId}`,
+        },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldRow = payload.old as Record<string, unknown>;
+            setDocs((prev) =>
+              prev.filter(
+                (p) =>
+                  !(
+                    p.studentUid === (oldRow.student_uid as string) &&
+                    p.topic === (oldRow.topic as string)
+                  ),
+              ),
+            );
+            return;
+          }
+
+          const progress = rowToStudentProgress(payload.new as Record<string, unknown>);
+          setDocs((prev) => {
+            const withoutExisting = prev.filter(
+              (p) => !(p.studentUid === progress.studentUid && p.topic === progress.topic),
+            );
+            return [...withoutExisting, progress];
+          });
+        },
+      )
+      .subscribe();
 
     return () => {
       cancelled = true;
-      unsubscribe?.();
+      supabase.removeChannel(channel);
     };
   }, [classId]);
 
@@ -394,26 +423,6 @@ function StudentDetailSheet({
   language,
 }: StudentDetailSheetProps) {
   const t = COPY[language];
-  const [overrideSubmitted, setOverrideSubmitted] = useState(false);
-
-  // Reset override state when sheet is re-opened for a new student
-  useEffect(() => {
-    if (open) setOverrideSubmitted(false);
-  }, [open, student?.studentId]);
-
-  const handleOverride = useCallback(async () => {
-    if (!student) return;
-    try {
-      await fetch('/api/teacher/override', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ studentId: student.studentId }),
-      });
-      setOverrideSubmitted(true);
-    } catch {
-      // Silently fail — teacher can retry
-    }
-  }, [student]);
 
   if (!student) return null;
 
@@ -506,33 +515,6 @@ function StudentDetailSheet({
               </ul>
             )}
           </div>
-        </div>
-
-        {/* Footer */}
-        <div className="px-6 py-4 border-t border-gray-100">
-          {overrideSubmitted ? (
-            <motion.p
-              initial={{ opacity: 0, y: 4 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="text-sm font-medium text-green-600 text-center"
-            >
-              ✓ {t.overrideConfirm}
-            </motion.p>
-          ) : (
-            <button
-              id="override-classification-btn"
-              onClick={handleOverride}
-              className={cn(
-                'w-full py-3 rounded-xl text-sm font-semibold',
-                'bg-gray-900 text-white',
-                'hover:bg-gray-800 active:bg-gray-950',
-                'transition-colors duration-150',
-                'shadow-sm hover:shadow-md',
-              )}
-            >
-              {t.overrideBtn}
-            </button>
-          )}
         </div>
       </div>
     </Sheet>

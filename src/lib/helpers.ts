@@ -1,3 +1,5 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
+
 export type StudentTier = 'red' | 'yellow' | 'green' | 'blue';
 export type MisconceptionSeverity = 'foundational' | 'procedural' | 'conceptual';
 export type ConfidenceLevel = 'guessed' | 'unsure' | 'knew';
@@ -39,19 +41,6 @@ export interface NextQuestionParams {
   difficulty: number;
   isTransferQuestion: boolean;
   isResetQuestion: boolean;
-}
-
-interface FirestoreDocument {
-  get(): Promise<{ exists: boolean; data(): Record<string, unknown> | undefined }>;
-  set(data: Record<string, unknown>, options?: { merge?: boolean }): Promise<unknown>;
-}
-
-interface FirestoreCollection {
-  doc(id: string): FirestoreDocument;
-}
-
-export interface FirestoreLike {
-  collection(name: string): FirestoreCollection;
 }
 
 function getUncleared(progress: StudentProgress): ActiveMisconception[] {
@@ -208,25 +197,15 @@ function createProgress(answer: Answer): StudentProgress {
   };
 }
 
-function toProgress(answer: Answer, data: Record<string, unknown> | undefined): StudentProgress {
-  const fallback = createProgress(answer);
-  if (!data) return fallback;
-
-  return {
-    ...fallback,
-    ...data,
-    activeMisconceptions: Array.isArray(data.activeMisconceptions)
-      ? (data.activeMisconceptions as ActiveMisconception[])
-      : [],
-  } as StudentProgress;
-}
-
 async function lookupMisconception(
-  db: FirestoreLike,
+  db: SupabaseClient,
   misconceptionId: string,
 ): Promise<Pick<ActiveMisconception, 'severity' | 'prerequisite_misconception_id'>> {
-  const snapshot = await db.collection('misconceptions').doc(misconceptionId).get();
-  const data = snapshot.data();
+  const { data } = await db
+    .from('misconceptions')
+    .select('severity, prerequisite_misconception_id')
+    .eq('id', misconceptionId)
+    .maybeSingle();
 
   return {
     severity: (data?.severity as MisconceptionSeverity | undefined) ?? 'conceptual',
@@ -235,18 +214,56 @@ async function lookupMisconception(
   };
 }
 
+function fromRow(row: Record<string, unknown> | null, answer: Answer): StudentProgress {
+  if (!row) return createProgress(answer);
+
+  return {
+    studentUid: row.student_uid as string,
+    classId: row.class_id as string,
+    topic: row.topic as string,
+    tier: row.tier as StudentTier,
+    activeMisconceptions: Array.isArray(row.active_misconceptions)
+      ? (row.active_misconceptions as ActiveMisconception[])
+      : [],
+    masteryScore: row.mastery_score as number,
+    consecutiveCorrect: row.consecutive_correct as number,
+    transferPassed: row.transfer_passed as boolean,
+    sessionsActive: (row.sessions_active as number | undefined) ?? 1,
+  };
+}
+
+function toRow(progress: StudentProgress, now: number) {
+  return {
+    student_uid: progress.studentUid,
+    class_id: progress.classId,
+    topic: progress.topic,
+    tier: progress.tier,
+    active_misconceptions: progress.activeMisconceptions,
+    mastery_score: progress.masteryScore,
+    consecutive_correct: progress.consecutiveCorrect,
+    transfer_passed: progress.transferPassed,
+    sessions_active: progress.sessionsActive ?? 1,
+    last_updated: new Date(now).toISOString(),
+  };
+}
+
 export async function updateStudentProgress(
-  db: FirestoreLike,
+  db: SupabaseClient,
   answerId: string,
   answer: Answer,
   isCorrect: boolean,
   misconceptionId: string | null,
   confidenceLevel: ConfidenceLevel,
 ): Promise<void> {
-  const progressId = `${answer.studentUid}_${answer.classId}_${answer.topic}`;
-  const progressRef = db.collection('studentProgress').doc(progressId);
-  const existing = await progressRef.get();
-  const progress = toProgress(answer, existing.data());
+  const { data: existingRow } = await db
+    .from('student_progress')
+    .select('*')
+    .eq('student_uid', answer.studentUid)
+    .eq('class_id', answer.classId)
+    .eq('topic', answer.topic)
+    .maybeSingle();
+
+  const progress = fromRow(existingRow, answer);
   const resolvedAnswer: Answer = {
     ...answer,
     isCorrect,
@@ -303,9 +320,19 @@ export async function updateStudentProgress(
 
   progress.tier = calculateTier(progress);
 
-  await progressRef.set({ ...progress, lastUpdated: now }, { merge: true });
-  await db.collection('answers').doc(answerId).set(
-    { misconceptionId, isCorrect, confidenceLevel, timestamp: now },
-    { merge: true },
-  );
+  await db
+    .from('student_progress')
+    .upsert(toRow(progress, now), { onConflict: 'student_uid,class_id,topic' });
+
+  await db.from('answers').upsert({
+    id: answerId,
+    student_uid: answer.studentUid,
+    class_id: answer.classId,
+    topic: answer.topic,
+    is_correct: isCorrect,
+    is_transfer_question: answer.isTransferQuestion,
+    misconception_id: misconceptionId,
+    confidence_level: confidenceLevel,
+    timestamp: new Date(now).toISOString(),
+  });
 }

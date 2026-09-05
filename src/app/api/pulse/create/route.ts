@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/firebase';
+import { supabaseAdmin } from '@/lib/supabase-admin';
 import { callGemini, parseGeminiJSON } from '@/lib/gemini';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -26,21 +26,6 @@ interface GeneratedQuestion {
   correctOption: 'A' | 'B' | 'C' | 'D';
   isTransferQuestion: boolean;
   isResetQuestion: boolean;
-}
-
-interface PulseDocument {
-  pulseId: string;
-  classId: string;
-  teacherUid: string;
-  questions: GeneratedQuestion[];
-  targetMisconception: {
-    misconceptionId: string;
-    topic: string;
-    studentCount: number;
-  } | null;
-  status: 'active' | 'completed' | 'expired';
-  createdAt: number;
-  expiresAt: number;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -89,12 +74,17 @@ async function findTopMisconception(
   classId: string,
   topicOverride?: string,
 ): Promise<TopMisconception | null> {
-  const snapshot = await db
-    .collection('studentProgress')
-    .where('classId', '==', classId)
-    .get();
+  const { data: rows, error } = await supabaseAdmin
+    .from('student_progress')
+    .select('*')
+    .eq('class_id', classId);
 
-  if (snapshot.empty) return null;
+  if (error) {
+    console.error('[pulse/create] Failed to fetch student_progress:', error);
+    return null;
+  }
+
+  if (!rows || rows.length === 0) return null;
 
   // Tally misconceptions across all students
   const tally = new Map<
@@ -102,15 +92,15 @@ async function findTopMisconception(
     { topic: string; count: number; maxPersistence: number }
   >();
 
-  snapshot.forEach((doc) => {
-    const data = doc.data();
-    const misconceptions = Array.isArray(data.activeMisconceptions)
-      ? data.activeMisconceptions
+  for (const row of rows) {
+    const topic = row.topic as string | undefined;
+    const misconceptions = Array.isArray(row.active_misconceptions)
+      ? row.active_misconceptions
       : [];
 
     for (const m of misconceptions) {
       if (m.isCleared) continue;
-      if (topicOverride && data.topic !== topicOverride) continue;
+      if (topicOverride && topic !== topicOverride) continue;
 
       const key = m.misconceptionId as string;
       const existing = tally.get(key);
@@ -122,13 +112,13 @@ async function findTopMisconception(
         );
       } else {
         tally.set(key, {
-          topic: data.topic ?? 'unknown',
+          topic: topic ?? 'unknown',
           count: 1,
           maxPersistence: m.persistenceScore ?? 0,
         });
       }
     }
-  });
+  }
 
   if (tally.size === 0) return null;
 
@@ -284,19 +274,17 @@ export async function POST(request: NextRequest) {
     console.log('[pulse/create] Creating pulse for class', body.classId);
 
     // 2 — Expire any existing active pulses for this class
-    const activePulses = await db
-      .collection('pulses')
-      .where('classId', '==', body.classId)
-      .where('status', '==', 'active')
-      .get();
+    const { data: expiredPulses, error: expireError } = await supabaseAdmin
+      .from('pulses')
+      .update({ status: 'expired' })
+      .eq('class_id', body.classId)
+      .eq('status', 'active')
+      .select('id');
 
-    const batch = db.batch();
-    activePulses.forEach((doc) => {
-      batch.update(doc.ref, { status: 'expired' });
-    });
-    if (!activePulses.empty) {
-      await batch.commit();
-      console.log(`[pulse/create] Expired ${activePulses.size} previous active pulse(s)`);
+    if (expireError) {
+      console.error('[pulse/create] Failed to expire previous pulses:', expireError);
+    } else if (expiredPulses && expiredPulses.length > 0) {
+      console.log(`[pulse/create] Expired ${expiredPulses.length} previous active pulse(s)`);
     }
 
     // 3 — Find the top misconception
@@ -333,24 +321,28 @@ export async function POST(request: NextRequest) {
     const now = Date.now();
     const pulseId = `pulse_${body.classId}_${now}`;
 
-    const pulseDoc: PulseDocument = {
-      pulseId,
-      classId: body.classId,
-      teacherUid: body.teacherUid,
-      questions,
-      targetMisconception: topMisconception
-        ? {
-            misconceptionId: topMisconception.misconceptionId,
-            topic: topMisconception.topic,
-            studentCount: topMisconception.studentCount,
-          }
-        : null,
-      status: 'active',
-      createdAt: now,
-      expiresAt: now + PULSE_TTL_MS,
-    };
+    const targetMisconception = topMisconception
+      ? {
+          misconceptionId: topMisconception.misconceptionId,
+          topic: topMisconception.topic,
+          studentCount: topMisconception.studentCount,
+        }
+      : null;
 
-    await db.collection('pulses').doc(pulseId).set(pulseDoc);
+    const { error: insertError } = await supabaseAdmin.from('pulses').insert({
+      id: pulseId,
+      class_id: body.classId,
+      teacher_uid: body.teacherUid,
+      questions,
+      target_misconception: targetMisconception,
+      status: 'active',
+      created_at: new Date(now).toISOString(),
+      expires_at: new Date(now + PULSE_TTL_MS).toISOString(),
+    });
+
+    if (insertError) {
+      throw insertError;
+    }
 
     console.log('[pulse/create] ✅ Pulse created:', pulseId);
 

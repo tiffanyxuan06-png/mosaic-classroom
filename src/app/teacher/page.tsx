@@ -2,32 +2,16 @@
 
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Wifi, Menu, X } from 'lucide-react';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  doc,
-  getDoc,
-  updateDoc,
-  orderBy,
-  limit,
-  type QueryConstraint,
-  type DocumentSnapshot,
-  type QuerySnapshot,
-  type QueryDocumentSnapshot,
-  type FirestoreError,
-} from 'firebase/firestore';
-import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore } from 'firebase/firestore';
-import { useAuthState } from 'react-firebase-hooks/auth';
-import { getAuth } from 'firebase/auth';
+import { Menu, X } from 'lucide-react';
+
+import { supabase } from '@/lib/supabase-client';
+import { useUserRole } from '@/lib/auth';
+import type { StudentProgress as HelpersStudentProgress } from '@/lib/helpers';
+import type { StudentTier as MasteryTier } from '@/lib/helpers';
 
 import ActionCard from '@/components/ActionCard';
 import ClassGapMap from '@/components/ClassGapMap';
 import PaperScanner from '@/components/PaperScanner';
-import type { StudentProgress, MasteryTier } from '@/lib/studentProgress';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Pulse types and components
@@ -282,28 +266,6 @@ function PulseResultsOverlay({
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Firebase initialization (client SDK)
-// ────────────────────────────────────────────────────────────────────────────
-
-const firebaseConfig = {
-  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
-};
-
-function getFirebaseApp() {
-  if (getApps().length > 0) return getApps()[0];
-  return initializeApp(firebaseConfig);
-}
-
-const firebaseApp = getFirebaseApp();
-const firebaseDb = getFirestore(firebaseApp);
-const firebaseAuth = getAuth(firebaseApp);
-
-// ────────────────────────────────────────────────────────────────────────────
 // Types
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -313,7 +275,7 @@ interface ClassData {
   classId: string;
   name: string;
   subject: string;
-  teacherUid: string;
+  teacherUid: string | null;
   topics: string[];
   kioskMode: boolean;
   studentCount: number;
@@ -326,18 +288,12 @@ interface InterventionGroup {
   students: Array<{ uid: string; name: string; masteryScore: number }>;
 }
 
-interface KioskSubmission {
-  studentName: string;
-  topic: string;
-  tierChange: string;
-  timestamp: number;
-}
-
 interface StudentForPanel {
   uid: string;
   name: string;
   email: string;
-  progress: StudentProgress;
+  /** One row per topic (canonical per-student-per-topic schema). */
+  progressByTopic: HelpersStudentProgress[];
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -373,19 +329,61 @@ function cn(...classes: (string | false | null | undefined)[]): string {
   return classes.filter(Boolean).join(' ');
 }
 
+function classRowToClassData(row: Record<string, unknown>): ClassData {
+  return {
+    classId: row.id as string,
+    name: row.name as string,
+    subject: row.subject as string,
+    teacherUid: (row.teacher_id as string | null) ?? null,
+    topics: Array.isArray(row.topics) ? (row.topics as string[]) : [],
+    kioskMode: Boolean(row.kiosk_mode),
+    studentCount: (row.student_count as number | undefined) ?? 0,
+  };
+}
+
+function progressRowToHelpers(row: Record<string, unknown>): HelpersStudentProgress {
+  return {
+    studentUid: row.student_uid as string,
+    classId: row.class_id as string,
+    topic: row.topic as string,
+    tier: row.tier as MasteryTier,
+    activeMisconceptions: Array.isArray(row.active_misconceptions)
+      ? (row.active_misconceptions as HelpersStudentProgress['activeMisconceptions'])
+      : [],
+    masteryScore: (row.mastery_score as number | undefined) ?? 0,
+    consecutiveCorrect: (row.consecutive_correct as number | undefined) ?? 0,
+    transferPassed: Boolean(row.transfer_passed),
+    sessionsActive: (row.sessions_active as number | undefined) ?? 1,
+  };
+}
+
+function pulseResponseRowToPulseResponse(row: Record<string, unknown>): PulseResponse {
+  return {
+    pulseId: row.pulse_id as string,
+    studentId: row.student_id as string,
+    answers: Array.isArray(row.answers)
+      ? (row.answers as PulseResponse['answers'])
+      : [],
+    completedAt: row.completed_at
+      ? new Date(row.completed_at as string).getTime()
+      : Date.now(),
+  };
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Main Component
 // ────────────────────────────────────────────────────────────────────────────
 
 export default function TeacherDashboard() {
   // Auth & navigation
-  const [user, authLoading] = useAuthState(firebaseAuth);
+  const { uid, loading: authLoading } = useUserRole();
   const [language, setLanguage] = useState<Language>('en');
 
   // Class data
   const [classData, setClassData] = useState<ClassData | null>(null);
-  const [activeStudentCount, setActiveStudentCount] = useState(0);
-  const [studentProgress, setStudentProgress] = useState<Map<string, StudentProgress>>(new Map());
+  const [studentProgress, setStudentProgress] = useState<Map<string, HelpersStudentProgress>>(
+    new Map(),
+  );
 
   // UI state
   const [selectedStudent, setSelectedStudent] = useState<StudentForPanel | null>(null);
@@ -393,7 +391,6 @@ export default function TeacherDashboard() {
   const [interventionGroupsOpen, setInterventionGroupsOpen] = useState(false);
   // Sorting is now handled inside ClassGapMap itself (its own priority/name
   // toggle) — this page no longer needs a duplicate sort-mode of its own.
-  const [kioskSubmissions, setKioskSubmissions] = useState<KioskSubmission[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Pulse state
@@ -417,7 +414,7 @@ export default function TeacherDashboard() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           classId: CLASS_ID,
-          teacherUid: user?.uid || 'teacher_001',
+          teacherUid: uid || 'teacher_001',
           topicOverride: classData?.topics?.[0],
         }),
       });
@@ -444,26 +441,61 @@ export default function TeacherDashboard() {
     } finally {
       setPulseLoading(false);
     }
-  }, [pulseLoading, user?.uid, classData?.topics, language, CLASS_ID]);
+  }, [pulseLoading, uid, classData?.topics, language, CLASS_ID]);
 
   // Listen to incoming pulse responses in real-time
   useEffect(() => {
     if (!activePulse) return;
 
-    const q = query(
-      collection(firebaseDb, 'pulseResponses'),
-      where('pulseId', '==', activePulse.pulseId),
-    );
+    let cancelled = false;
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const resps: PulseResponse[] = [];
-      snapshot.forEach((d) => {
-        resps.push(d.data() as PulseResponse);
+    supabase
+      .from('pulse_responses')
+      .select('*')
+      .eq('pulse_id', activePulse.pulseId)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error('[teacher] Error loading initial pulse responses:', error);
+          return;
+        }
+        setPulseResponses((data ?? []).map(pulseResponseRowToPulseResponse));
       });
-      setPulseResponses(resps);
-    });
 
-    return () => unsubscribe();
+    const channel = supabase
+      .channel(`pulse-responses-${activePulse.pulseId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'pulse_responses',
+          filter: `pulse_id=eq.${activePulse.pulseId}`,
+        },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldRow = payload.old as Record<string, unknown>;
+            setPulseResponses((prev) =>
+              prev.filter((r) => r.studentId !== (oldRow.student_id as string)),
+            );
+            return;
+          }
+
+          const row = pulseResponseRowToPulseResponse(
+            payload.new as Record<string, unknown>,
+          );
+          setPulseResponses((prev) => {
+            const withoutExisting = prev.filter((r) => r.studentId !== row.studentId);
+            return [...withoutExisting, row];
+          });
+        },
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase.removeChannel(channel);
+    };
   }, [activePulse]);
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -473,117 +505,128 @@ export default function TeacherDashboard() {
   useEffect(() => {
     if (!CLASS_ID) return;
 
-    const classDocRef = doc(firebaseDb, 'classes', CLASS_ID);
-    const unsubscribe = onSnapshot(
-      classDocRef,
-      (snapshot: DocumentSnapshot) => {
-        if (snapshot.exists()) {
-          setClassData(snapshot.data() as ClassData);
+    let cancelled = false;
+
+    supabase
+      .from('classes')
+      .select('*')
+      .eq('id', CLASS_ID)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error('[teacher] Error loading class:', error);
+        } else if (data) {
+          setClassData(classRowToClassData(data));
         }
         setLoading(false);
-      },
-      (error: FirestoreError) => {
-        console.error('[teacher] Error loading class:', error);
-        setLoading(false);
-      },
-    );
+      });
 
-    return () => unsubscribe();
+    const channel = supabase
+      .channel(`classes-${CLASS_ID}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'classes',
+          filter: `id=eq.${CLASS_ID}`,
+        },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            setClassData(null);
+            return;
+          }
+          setClassData(classRowToClassData(payload.new as Record<string, unknown>));
+        },
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase.removeChannel(channel);
+    };
   }, []);
 
   // ──────────────────────────────────────────────────────────────────────────
-  // Listen to active quiz sessions (student count with active quizzes)
+  // Load all student progress for the class (one row per student per topic)
   // ──────────────────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!CLASS_ID) return;
 
-    const constraints: QueryConstraint[] = [
-      where('classId', '==', CLASS_ID),
-      where('active', '==', true),
-    ];
+    let cancelled = false;
 
-    const q = query(collection(firebaseDb, 'quizSessions'), ...constraints);
+    const rowKey = (studentUid: string, topic: string) => `${studentUid}::${topic}`;
 
-    const unsubscribe = onSnapshot(q, (snapshot: QuerySnapshot) => {
-      setActiveStudentCount(snapshot.size);
+    supabase
+      .from('student_progress')
+      .select('*')
+      .eq('class_id', CLASS_ID)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error('[teacher] Error loading student progress:', error);
+          return;
+        }
+        const map = new Map<string, HelpersStudentProgress>();
+        for (const row of data ?? []) {
+          const progress = progressRowToHelpers(row);
+          map.set(rowKey(progress.studentUid, progress.topic), progress);
+        }
+        setStudentProgress(map);
+      });
+
+    const channel = supabase
+      .channel(`student-progress-${CLASS_ID}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'student_progress',
+          filter: `class_id=eq.${CLASS_ID}`,
+        },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldRow = payload.old as Record<string, unknown>;
+            setStudentProgress((prev) => {
+              const next = new Map(prev);
+              next.delete(rowKey(oldRow.student_uid as string, oldRow.topic as string));
+              return next;
+            });
+            return;
+          }
+
+          const progress = progressRowToHelpers(payload.new as Record<string, unknown>);
+          setStudentProgress((prev) => {
+            const next = new Map(prev);
+            next.set(rowKey(progress.studentUid, progress.topic), progress);
+            return next;
+          });
+        },
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Group progress rows by student uid (one entry per student, all topics)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  const progressByStudent = useMemo(() => {
+    const map = new Map<string, HelpersStudentProgress[]>();
+    studentProgress.forEach((progress) => {
+      const list = map.get(progress.studentUid) ?? [];
+      list.push(progress);
+      map.set(progress.studentUid, list);
     });
-
-    return () => unsubscribe();
-  }, []);
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // Load all student progress for the class
-  // ──────────────────────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (!CLASS_ID) return;
-
-    const constraints: QueryConstraint[] = [where('classId', '==', CLASS_ID)];
-
-    const q = query(collection(firebaseDb, 'studentProgress'), ...constraints);
-
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot: QuerySnapshot) => {
-        const newProgressMap = new Map<string, StudentProgress>();
-
-        snapshot.forEach((docSnap: QueryDocumentSnapshot) => {
-          const data = docSnap.data();
-          newProgressMap.set(docSnap.id, data as StudentProgress);
-        });
-
-        setStudentProgress(newProgressMap);
-      },
-      (error: FirestoreError) => {
-        console.error('[teacher] Error loading student progress:', error);
-      },
-    );
-
-    return () => unsubscribe();
-  }, []);
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // Kiosk activity feed — only listened to while kiosk mode is on, so the
-  // dashboard doesn't hold an idle subscription for classes that never use it.
-  // ──────────────────────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (!CLASS_ID || !classData?.kioskMode) {
-      setKioskSubmissions([]);
-      return;
-    }
-
-    const q = query(
-      collection(firebaseDb, 'kioskSubmissions'),
-      where('classId', '==', CLASS_ID),
-      orderBy('timestamp', 'desc'),
-      limit(20),
-    );
-
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot: QuerySnapshot) => {
-        const submissions = snapshot.docs.map((docSnap: QueryDocumentSnapshot) => {
-          const data = docSnap.data();
-          return {
-            studentName: data.studentName ?? 'Unknown',
-            topic: data.topic ?? '',
-            tierChange: data.tierChange ?? '',
-            timestamp:
-              typeof data.timestamp?.toMillis === 'function' ? data.timestamp.toMillis() : Date.now(),
-          } satisfies KioskSubmission;
-        });
-
-        setKioskSubmissions(submissions);
-      },
-      (error: FirestoreError) => {
-        console.error('[teacher] Error loading kiosk submissions:', error);
-      },
-    );
-
-    return () => unsubscribe();
-  }, [classData?.kioskMode]);
+    return map;
+  }, [studentProgress]);
 
   // ──────────────────────────────────────────────────────────────────────────
   // Group students by intervention tier
@@ -618,8 +661,8 @@ export default function TeacherDashboard() {
     };
 
     // For now, group by the worst tier across all topics
-    studentProgress.forEach((progress, uid) => {
-      const tiers = Object.values(progress.topics || {}).map((t) => t.tier);
+    progressByStudent.forEach((progressList, studentUid) => {
+      const tiers = progressList.map((p) => p.tier);
       const worstTier: MasteryTier =
         tiers.includes('red')
           ? 'red'
@@ -631,36 +674,35 @@ export default function TeacherDashboard() {
 
       // For group C (green), split on masteryScore
       if (worstTier === 'green') {
-        // Calculate average mastery score
-        const topicScores = Object.values(progress.topics || {}).map((t) => {
-          return (t.tier === 'blue' ? 95 : t.tier === 'green' ? 75 : 40) as number;
+        const topicScores = progressList.map((p) => {
+          return (p.tier === 'blue' ? 95 : p.tier === 'green' ? 75 : 40) as number;
         });
         const avgScore: number = topicScores.length > 0 ? topicScores.reduce((a, b) => a + b) / topicScores.length : 75;
 
         if (avgScore < 90) {
           groups.green.students.push({
-            uid,
-            name: progress.studentId || 'Unknown',
+            uid: studentUid,
+            name: studentUid,
             masteryScore: Math.round(avgScore),
           });
         } else {
           groups.blue.students.push({
-            uid,
-            name: progress.studentId || 'Unknown',
+            uid: studentUid,
+            name: studentUid,
             masteryScore: Math.round(avgScore),
           });
         }
       } else {
         groups[worstTier].students.push({
-          uid,
-          name: progress.studentId || 'Unknown',
+          uid: studentUid,
+          name: studentUid,
           masteryScore: 50, // placeholder
         });
       }
     });
 
     return [groups.red, groups.yellow, groups.green, groups.blue];
-  }, [studentProgress]);
+  }, [progressByStudent]);
 
   // ──────────────────────────────────────────────────────────────────────────
   // Handler: Toggle kiosk mode
@@ -670,8 +712,11 @@ export default function TeacherDashboard() {
     if (!classData) return;
 
     try {
-      const classRef = doc(firebaseDb, 'classes', CLASS_ID);
-      await updateDoc(classRef, { kioskMode: !classData.kioskMode });
+      const { error } = await supabase
+        .from('classes')
+        .update({ kiosk_mode: !classData.kioskMode })
+        .eq('id', CLASS_ID);
+      if (error) throw error;
     } catch (error) {
       console.error('[teacher] Error toggling kiosk mode:', error);
     }
@@ -716,50 +761,27 @@ export default function TeacherDashboard() {
   // ──────────────────────────────────────────────────────────────────────────
 
   const handleSelectStudent = async (studentUid: string) => {
-    const progress = studentProgress.get(studentUid);
-    if (!progress) return;
+    const progressList = progressByStudent.get(studentUid);
+    if (!progressList || progressList.length === 0) return;
 
-    // Fetch full student data from users collection
+    // Fetch full student data from the profiles table
     try {
-      const userDoc = await getDoc(doc(firebaseDb, 'users', studentUid));
-      if (userDoc.exists()) {
-        setSelectedStudent({
-          uid: studentUid,
-          name: userDoc.data().name || 'Unknown',
-          email: userDoc.data().email || '',
-          progress,
-        });
-        setPanelOpen(true);
-      }
+      const { data: profileRow, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', studentUid)
+        .maybeSingle();
+      if (error) throw error;
+
+      setSelectedStudent({
+        uid: studentUid,
+        name: (profileRow?.name as string | undefined) || 'Unknown',
+        email: (profileRow?.email as string | undefined) || '',
+        progressByTopic: progressList,
+      });
+      setPanelOpen(true);
     } catch (error) {
       console.error('[teacher] Error loading student:', error);
-    }
-  };
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // Handler: Override misconception (calls PATCH /api/override/misconception)
-  // ──────────────────────────────────────────────────────────────────────────
-
-  const handleOverrideMisconception = async (misconceptionId: string) => {
-    if (!selectedStudent) return;
-
-    try {
-      const response = await fetch('/api/override/misconception', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentUid: selectedStudent.uid,
-          misconceptionId,
-          classId: CLASS_ID,
-        }),
-      });
-
-      if (!response.ok) throw new Error('Failed to override misconception');
-
-      // Refetch student data
-      handleSelectStudent(selectedStudent.uid);
-    } catch (error) {
-      console.error('[teacher] Error overriding misconception:', error);
     }
   };
 
@@ -812,7 +834,7 @@ export default function TeacherDashboard() {
     );
   }
 
-  if (!user) {
+  if (!uid) {
     return (
       <div className="flex h-screen items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100">
         <div className="text-center">
@@ -851,14 +873,6 @@ export default function TeacherDashboard() {
             </div>
 
             <div className="flex items-center gap-3 flex-wrap">
-              {/* Active count */}
-              <div className="flex items-center gap-2 rounded-lg bg-blue-50 px-3 py-2">
-                <Wifi className="h-5 w-5 text-blue-600" />
-                <span className="font-medium text-blue-700">
-                  {activeStudentCount} {language === 'en' ? 'active' : 'aktif'}
-                </span>
-              </div>
-
               {/* Push Pulse Check button */}
               <button
                 type="button"
@@ -960,7 +974,7 @@ export default function TeacherDashboard() {
             <section>
               <ActionCard
                 classId={CLASS_ID}
-                classSize={activeStudentCount || 30}
+                classSize={classData.studentCount || 30}
                 subject={classData.subject}
                 topic={classData.topics?.[0] || 'fractions'}
               />
@@ -1021,9 +1035,13 @@ export default function TeacherDashboard() {
 
                           <div className="mb-4 flex flex-wrap gap-2">
                             {group.students.map((student) => (
-                              <div key={student.uid} className="rounded-lg bg-slate-100 px-3 py-1 text-sm text-slate-700">
+                              <button
+                                key={student.uid}
+                                onClick={() => handleSelectStudent(student.uid)}
+                                className="rounded-lg bg-slate-100 px-3 py-1 text-sm text-slate-700 hover:bg-slate-200 transition-colors"
+                              >
                                 {student.name}
-                              </div>
+                              </button>
                             ))}
                           </div>
 
@@ -1042,36 +1060,6 @@ export default function TeacherDashboard() {
                 </AnimatePresence>
               </motion.div>
             </section>
-
-            {/* 4. Kiosk activity feed (conditional) */}
-            {classData.kioskMode && (
-              <section>
-                <div className="rounded-lg bg-white p-6 shadow-sm">
-                  <h2 className="mb-4 text-lg font-semibold text-slate-900">
-                    {language === 'en' ? 'Kiosk Activity' : 'Aktiviti Kiosk'}
-                  </h2>
-                  <div className="space-y-3">
-                    {kioskSubmissions.length === 0 ? (
-                      <p className="text-slate-500">
-                        {language === 'en' ? 'No recent submissions' : 'Tiada penyerahan terbaru'}
-                      </p>
-                    ) : (
-                      kioskSubmissions.map((submission, idx) => (
-                        <div key={idx} className="flex items-center justify-between rounded-lg bg-slate-50 p-3">
-                          <div>
-                            <p className="font-medium text-slate-900">{submission.studentName}</p>
-                            <p className="text-sm text-slate-500">{submission.topic}</p>
-                          </div>
-                          <span className="text-xs font-medium text-slate-600">
-                            {new Date(submission.timestamp).toLocaleTimeString()}
-                          </span>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-              </section>
-            )}
           </div>
         </main>
 
@@ -1107,11 +1095,11 @@ export default function TeacherDashboard() {
                     {language === 'en' ? 'Status' : 'Status'}
                   </label>
                   <div className="mt-2">
-                    {Object.entries(selectedStudent.progress.topics || {}).map(([topicKey, topicData]) => (
-                      <div key={topicKey} className="mb-2 flex items-center gap-2">
-                        <div className={cn('h-3 w-3 rounded-full', TIER_COLORS[topicData.tier].dot)} />
+                    {selectedStudent.progressByTopic.map((progress) => (
+                      <div key={progress.topic} className="mb-2 flex items-center gap-2">
+                        <div className={cn('h-3 w-3 rounded-full', TIER_COLORS[progress.tier].dot)} />
                         <span className="text-sm font-medium capitalize text-slate-700">
-                          {topicKey}: {language === 'en' ? TIER_LABELS[topicData.tier].en : TIER_LABELS[topicData.tier].bm}
+                          {progress.topic}: {language === 'en' ? TIER_LABELS[progress.tier].en : TIER_LABELS[progress.tier].bm}
                         </span>
                       </div>
                     ))}
@@ -1124,44 +1112,20 @@ export default function TeacherDashboard() {
                     {language === 'en' ? 'Active Misconceptions' : 'Konsepsi Salah Aktif'}
                   </label>
                   <div className="mt-2 space-y-2">
-                    {Object.entries(selectedStudent.progress.topics || {})
-                      .filter(([, t]) => t.activeMisconceptionId)
-                      .map(([, topicData]) => (
-                        <div key={topicData.activeMisconceptionId} className="rounded-lg bg-slate-100 p-3 text-sm">
-                          <p className="font-medium text-slate-900">
-                            {language === 'en'
-                              ? topicData.activeMisconceptionLabel
-                              : topicData.activeMisconceptionLabel_bm}
+                    {selectedStudent.progressByTopic
+                      .flatMap((progress) =>
+                        progress.activeMisconceptions
+                          .filter((m) => !m.isCleared)
+                          .map((m) => ({ ...m, topic: progress.topic })),
+                      )
+                      .map((m) => (
+                        <div key={`${m.topic}-${m.misconceptionId}`} className="rounded-lg bg-slate-100 p-3 text-sm">
+                          <p className="font-medium text-slate-900 capitalize">
+                            {m.misconceptionId.replace(/_/g, ' ')}
                           </p>
+                          <p className="text-xs text-slate-500 mt-0.5 capitalize">{m.topic}</p>
                         </div>
                       ))}
-                  </div>
-                </div>
-
-                {/* Override misconception dropdown */}
-                <div>
-                  <label className="text-xs font-semibold uppercase text-slate-500">
-                    {language === 'en' ? 'Override Classification' : 'Timpa Pengelasan'}
-                  </label>
-                  <div className="mt-2">
-                    <select
-                      onChange={(e) => {
-                        if (e.target.value) {
-                          handleOverrideMisconception(e.target.value);
-                          e.target.value = '';
-                        }
-                      }}
-                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 hover:border-slate-400"
-                    >
-                      <option value="">
-                        {language === 'en'
-                          ? 'Select misconception...'
-                          : 'Pilih konsepsi salah...'}
-                      </option>
-                      {/* TODO: Load misconceptions from Firestore */}
-                      <option value="frac_add_across">Adds numerators and denominators</option>
-                      <option value="dec_longer_is_larger">More decimals = larger</option>
-                    </select>
                   </div>
                 </div>
 

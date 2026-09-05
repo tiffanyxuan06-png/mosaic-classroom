@@ -2,9 +2,7 @@
 
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
-import { collection, getDocs, query, where } from "firebase/firestore";
 
-import { db } from "@/lib/firebase-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -34,16 +32,15 @@ export default function KioskEntryPage() {
 
     setLoading(true);
     try {
-      const classesRef = collection(db, "classes");
-      const matchingClass = query(classesRef, where("kioskCode", "==", kioskCode));
-      const snap = await getDocs(matchingClass);
+      const res = await fetch(`/api/kiosk/lookup?code=${encodeURIComponent(kioskCode)}`);
 
-      if (snap.empty) {
+      if (!res.ok) {
         setError("No class found with that code. Check with your teacher.");
         return;
       }
 
-      router.push(`/kiosk/${snap.docs[0].id}`);
+      const data: { classId: string } = await res.json();
+      router.push(`/kiosk/${data.classId}`);
     } catch (err) {
       console.error("[kiosk] class lookup error", err);
       setError("Something went wrong. Try again.");

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/firebase';
+import { supabaseAdmin } from '@/lib/supabase-admin';
 import { callGemini, parseGeminiJSON } from '@/lib/gemini';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -65,45 +65,47 @@ function isValidClassification(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Firestore helpers
+// Supabase helpers
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Fetch all misconception documents that match the given subject + topic.
+ * Fetch all misconception rows that match the given subject + topic.
  *
- * Expected Firestore collection: `misconceptions`
- * Expected document fields (at minimum):
- *   - misconceptionId: string
- *   - name: string
- *   - wrong_answer_pattern: string
- *   - subject: string
- *   - topic: string
+ * Table: `misconceptions`
+ * Expected columns (at minimum):
+ *   - id: text (misconception identifier)
+ *   - name: text
+ *   - wrong_answer_pattern: text
+ *   - subject: text
+ *   - topic: text
  */
 async function fetchMisconceptionLibrary(
   subject: string,
   topic: string,
 ): Promise<MisconceptionEntry[]> {
-  const snapshot = await db
-    .collection('misconceptions')
-    .where('subject', '==', subject)
-    .where('topic', '==', topic)
-    .get();
+  const { data, error } = await supabaseAdmin
+    .from('misconceptions')
+    .select('*')
+    .eq('subject', subject)
+    .eq('topic', topic);
 
-  if (snapshot.empty) {
+  if (error) {
+    console.error('[quiz/classify] Failed to fetch misconceptions:', error);
+    return [];
+  }
+
+  if (!data || data.length === 0) {
     console.warn(
       `[quiz/classify] No misconceptions found for subject="${subject}", topic="${topic}"`,
     );
     return [];
   }
 
-  return snapshot.docs.map((doc) => {
-    const data = doc.data();
-    return {
-      misconceptionId: data.misconceptionId ?? doc.id,
-      name: data.name ?? 'Unknown misconception',
-      wrong_answer_pattern: data.wrong_answer_pattern ?? '',
-    };
-  });
+  return data.map((row) => ({
+    misconceptionId: row.id,
+    name: row.name ?? 'Unknown misconception',
+    wrong_answer_pattern: row.wrong_answer_pattern ?? '',
+  }));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -170,7 +172,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         {
           error: 'No misconceptions found',
-          details: `No misconception documents in Firestore for subject="${body.subject}", topic="${body.topic}". Seed the misconceptions collection first.`,
+          details: `No misconception rows in Supabase for subject="${body.subject}", topic="${body.topic}". Seed the misconceptions table first.`,
         },
         { status: 404 },
       );

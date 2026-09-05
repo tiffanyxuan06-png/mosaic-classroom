@@ -2,19 +2,17 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import type { RealtimeChannel } from '@supabase/supabase-js';
 import QuizQuestion, { type QuizQuestionData } from '@/components/QuizQuestion';
 import FeedbackCard from '@/components/FeedbackCard';
+import { supabase } from '@/lib/supabase-client';
 import {
-  updateStudentProgress,
-  subscribeStudentProgress,
   getNextQuestionParams,
-  makeDefaultProgress,
-  DEFAULT_TOPICS,
   type StudentProgress,
-  type TopicProgress,
-  type MasteryTier,
-  type AnswerPayload,
-} from '@/lib/studentProgress';
+  type StudentTier,
+  type ConfidenceLevel,
+  type Answer,
+} from '@/lib/helpers';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -23,7 +21,10 @@ import {
 // Demo student — in production this comes from auth
 const STUDENT_ID = 'demo_student_001';
 const CLASS_ID = 'class_6A';
+const SUBJECT = 'mathematics';
+const CURRENT_TOPIC = 'fractions';
 const TOTAL_MISSIONS = 4;
+const MISSION_INDEX = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pulse types
@@ -36,32 +37,12 @@ interface PulseQuestion {
   correctOption: string;
 }
 
-interface PulseDoc {
-  pulseId: string;
-  classId: string;
+interface PulseRow {
+  id: string;
+  class_id: string;
   questions: PulseQuestion[];
   status: 'active' | 'completed' | 'expired';
-  createdAt: number;
-  expiresAt: number;
-}
-
-// Firebase client init (matches codebase pattern)
-async function getClientFirestore() {
-  const { initializeApp, getApps } = await import('firebase/app');
-  const { getFirestore } = await import('firebase/firestore');
-
-  const firebaseConfig = {
-    apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-    authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
-    projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-  };
-
-  const app =
-    getApps().length > 0
-      ? getApps()[0]
-      : initializeApp(firebaseConfig, 'client');
-
-  return getFirestore(app);
+  created_at: string;
 }
 
 const MISSIONS: Record<number, { label_en: string; label_bm: string }> = {
@@ -92,7 +73,7 @@ interface AnswerState {
   misconceptionId: string | null;
   misconceptionLabel: string | null;
   misconceptionLabel_bm: string | null;
-  confidenceLevel: 'guessed' | 'unsure' | 'knew';
+  confidenceLevel: ConfidenceLevel;
   timeSpentMs: number;
   answerChanges: number;
 }
@@ -105,8 +86,37 @@ function cn(...classes: (string | false | null | undefined)[]): string {
   return classes.filter(Boolean).join(' ');
 }
 
+function defaultProgress(studentUid: string, classId: string, topic: string): StudentProgress {
+  return {
+    studentUid,
+    classId,
+    topic,
+    tier: 'green',
+    activeMisconceptions: [],
+    masteryScore: 0,
+    consecutiveCorrect: 0,
+    transferPassed: false,
+    sessionsActive: 1,
+  };
+}
+
+async function fetchMisconceptionLabels(
+  misconceptionId: string,
+): Promise<{ en: string | null; bm: string | null }> {
+  const { data } = await supabase
+    .from('misconceptions')
+    .select('plain_language_label, plain_language_label_bm')
+    .eq('id', misconceptionId)
+    .maybeSingle();
+
+  return {
+    en: (data?.plain_language_label as string | undefined) ?? null,
+    bm: (data?.plain_language_label_bm as string | undefined) ?? null,
+  };
+}
+
 const TIER_STYLES: Record<
-  MasteryTier,
+  StudentTier,
   { dot: string; badge: string; label_en: string; label_bm: string }
 > = {
   red: {
@@ -183,22 +193,18 @@ function MissionProgressBar({
 // ─────────────────────────────────────────────────────────────────────────────
 
 function TopicMasteryCard({
-  topicProgress,
+  progress,
+  activeMisconceptionLabel,
   language,
-  isActive,
 }: {
-  topicProgress: TopicProgress;
+  progress: StudentProgress;
+  activeMisconceptionLabel: string | null;
   language: Language;
-  isActive: boolean;
 }) {
-  const tier = topicProgress.tier;
+  const tier = progress.tier;
   const styles = TIER_STYLES[tier];
-  const topicName =
-    TOPIC_DISPLAY[topicProgress.topic]?.[language] ?? topicProgress.topic;
-  const misconceptionText =
-    language === 'bm'
-      ? topicProgress.activeMisconceptionLabel_bm
-      : topicProgress.activeMisconceptionLabel;
+  const topicName = TOPIC_DISPLAY[progress.topic]?.[language] ?? progress.topic;
+  const hasUnclearedMisconception = progress.activeMisconceptions.some((m) => !m.isCleared);
 
   return (
     <motion.div
@@ -208,17 +214,13 @@ function TopicMasteryCard({
       className={cn(
         'rounded-xl border-2 p-4 transition-shadow duration-200',
         styles.badge,
-        isActive && 'ring-2 ring-blue-400 ring-offset-2',
       )}
     >
       {/* Header row */}
       <div className="flex items-center justify-between gap-2 mb-2">
         <span className="font-semibold text-sm leading-tight">{topicName}</span>
         <span
-          className={cn(
-            'flex-shrink-0 w-3 h-3 rounded-full',
-            styles.dot,
-          )}
+          className={cn('flex-shrink-0 w-3 h-3 rounded-full', styles.dot)}
           title={tier.toUpperCase()}
           aria-label={`${tier} tier`}
         />
@@ -238,16 +240,17 @@ function TopicMasteryCard({
       </p>
 
       {/* Misconception hint */}
-      {(tier === 'red' || tier === 'yellow') && misconceptionText && (
+      {(tier === 'red' || tier === 'yellow') && hasUnclearedMisconception && activeMisconceptionLabel && (
         <p className="text-[11px] leading-snug opacity-80 italic line-clamp-2">
-          &quot;{misconceptionText}&quot;
+          &quot;{activeMisconceptionLabel}&quot;
         </p>
       )}
 
-      {/* Questions attempted */}
+      {/* Mastery score */}
       <p className="text-[10px] mt-2 opacity-50">
-        {topicProgress.questionsAttempted}{' '}
-        {language === 'bm' ? 'soalan dijawab' : 'questions answered'}
+        {language === 'bm'
+          ? `Skor penguasaan: ${progress.masteryScore}`
+          : `Mastery score: ${progress.masteryScore}`}
       </p>
     </motion.div>
   );
@@ -259,17 +262,15 @@ function TopicMasteryCard({
 
 function MasteryMapPanel({
   progress,
+  activeMisconceptionLabel,
   language,
   onLanguageToggle,
 }: {
-  progress: StudentProgress | null;
+  progress: StudentProgress;
+  activeMisconceptionLabel: string | null;
   language: Language;
   onLanguageToggle: () => void;
 }) {
-  const topics = progress
-    ? Object.values(progress.topics)
-    : DEFAULT_TOPICS;
-
   return (
     <div className="flex flex-col h-full">
       {/* Panel header */}
@@ -339,17 +340,15 @@ function MasteryMapPanel({
         ))}
       </div>
 
-      {/* Topic cards grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-3 overflow-y-auto flex-1 pr-1">
+      {/* Topic cards */}
+      <div className="grid grid-cols-1 gap-3 overflow-y-auto flex-1 pr-1">
         <AnimatePresence mode="popLayout">
-          {topics.map((t) => (
-            <TopicMasteryCard
-              key={t.topic}
-              topicProgress={t}
-              language={language}
-              isActive={progress?.currentTopic === t.topic}
-            />
-          ))}
+          <TopicMasteryCard
+            key={progress.topic}
+            progress={progress}
+            activeMisconceptionLabel={activeMisconceptionLabel}
+            language={language}
+          />
         </AnimatePresence>
       </div>
 
@@ -357,7 +356,7 @@ function MasteryMapPanel({
       <div className="flex items-center gap-1.5 mt-4 pt-3 border-t border-slate-100">
         <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
         <span className="text-[10px] text-slate-400">
-          {language === 'bm' ? 'Tersambung ke Firestore' : 'Live — Firestore connected'}
+          {language === 'bm' ? 'Tersambung ke Supabase' : 'Live — Supabase connected'}
         </span>
       </div>
     </div>
@@ -426,7 +425,7 @@ function PulseQuizOverlay({
   language,
   onComplete,
 }: {
-  pulse: PulseDoc;
+  pulse: PulseRow;
   studentId: string;
   language: Language;
   onComplete: () => void;
@@ -460,23 +459,24 @@ function PulseQuizOverlay({
     setAnswers(newAnswers);
 
     if (isLast) {
-      // Write pulseResponse to Firestore
+      // Write pulse_response via the service-role route (this demo student
+      // session has no real Supabase Auth session for RLS to match against).
       setSubmitting(true);
       try {
-        const { doc: clientDoc, setDoc: clientSetDoc } = await import(
-          'firebase/firestore'
-        );
-        const db = await getClientFirestore();
-
-        const responseId = `${pulse.pulseId}_${studentId}`;
-        const ref = clientDoc(db, 'pulseResponses', responseId);
-        await clientSetDoc(ref, {
-          pulseId: pulse.pulseId,
-          studentId,
-          classId: pulse.classId,
-          answers: newAnswers,
-          completedAt: Date.now(),
+        const res = await fetch('/api/pulse/respond', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pulseId: pulse.id,
+            studentId,
+            classId: pulse.class_id,
+            answers: newAnswers,
+          }),
         });
+
+        if (!res.ok) {
+          console.error('[student] pulse response write failed:', await res.text());
+        }
       } catch (err) {
         console.error('[student] pulse response write failed:', err);
       }
@@ -584,81 +584,105 @@ export default function StudentPage() {
 
   const [answerState, setAnswerState] = useState<AnswerState | null>(null);
 
-  const [studentProgress, setStudentProgress] =
-    useState<StudentProgress | null>(null);
+  const [studentProgress, setStudentProgress] = useState<StudentProgress>(
+    defaultProgress(STUDENT_ID, CLASS_ID, CURRENT_TOPIC),
+  );
+  const [activeMisconceptionLabel, setActiveMisconceptionLabel] = useState<string | null>(null);
 
   // Pulse state
-  const [activePulse, setActivePulse] = useState<PulseDoc | null>(null);
+  const [activePulse, setActivePulse] = useState<PulseRow | null>(null);
   const [showPulseToast, setShowPulseToast] = useState(false);
   const [showPulseOverlay, setShowPulseOverlay] = useState(false);
 
   // Tracking refs across question chain
-  const consecutiveCorrectRef = useRef(0);
-  const lastWasTransferRef = useRef(false);
+  const studentProgressRef = useRef<StudentProgress>(studentProgress);
+  const sessionHistoryRef = useRef<Answer[]>([]);
   const recentQuestionsRef = useRef<string[]>([]);
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
+  useEffect(() => {
+    studentProgressRef.current = studentProgress;
+  }, [studentProgress]);
 
-  const currentProgress =
-    studentProgress ?? makeDefaultProgress(STUDENT_ID, CLASS_ID);
+  // ── Derived UI state ─────────────────────────────────────────────────────
 
-  const missionIndex = currentProgress.currentMissionIndex ?? 0;
   const missionLabel =
     language === 'bm'
-      ? MISSIONS[missionIndex]?.label_bm
-      : MISSIONS[missionIndex]?.label_en;
+      ? MISSIONS[MISSION_INDEX]?.label_bm
+      : MISSIONS[MISSION_INDEX]?.label_en;
 
-  const currentTopicProgress =
-    currentProgress.topics[currentProgress.currentTopic];
-  const isBlue = currentTopicProgress?.tier === 'blue';
+  const isBlue = studentProgress.tier === 'blue';
+
+  // Keep the active misconception's display label in sync with whichever
+  // misconception is currently uncleared for this topic.
+  useEffect(() => {
+    const active = studentProgress.activeMisconceptions.find((m) => !m.isCleared);
+    if (!active) {
+      setActiveMisconceptionLabel(null);
+      return;
+    }
+
+    let cancelled = false;
+    fetchMisconceptionLabels(active.misconceptionId).then((labels) => {
+      if (cancelled) return;
+      setActiveMisconceptionLabel(language === 'bm' ? labels.bm ?? labels.en : labels.en);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [studentProgress.activeMisconceptions, language]);
 
   // ── Fetch question ─────────────────────────────────────────────────────────
 
-  const fetchQuestion = useCallback(
-    async (params?: Partial<Parameters<typeof getNextQuestionParams>[0]>) => {
-      setQuestionLoading(true);
-      setQuestionError(null);
+  const fetchQuestion = useCallback(async () => {
+    setQuestionLoading(true);
+    setQuestionError(null);
 
-      try {
-        const nextParams = getNextQuestionParams(
-          currentProgress,
-          consecutiveCorrectRef.current > 0,
-          lastWasTransferRef.current,
-          consecutiveCorrectRef.current,
-          recentQuestionsRef.current,
-        );
+    try {
+      const progress = studentProgressRef.current;
+      const nextParams = getNextQuestionParams(progress, sessionHistoryRef.current);
 
-        const body = {
-          ...nextParams,
-          previousQuestionTexts: recentQuestionsRef.current.slice(-5),
-          ...params,
-        };
-
-        const res = await fetch('/api/quiz/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-        const data: QuizQuestionData = await res.json();
-        setQuestion(data);
-
-        // Track for de-duplication
-        recentQuestionsRef.current = [
-          ...recentQuestionsRef.current.slice(-9),
-          data.questionText,
-        ];
-      } catch (err) {
-        console.error('[student] fetchQuestion error', err);
-        setQuestionError('Could not load the next question. Please retry.');
-      } finally {
-        setQuestionLoading(false);
+      let activeMisconceptionDescription: string | null = null;
+      if (nextParams.misconceptionId) {
+        const labels = await fetchMisconceptionLabels(nextParams.misconceptionId);
+        activeMisconceptionDescription =
+          language === 'bm' ? labels.bm ?? labels.en : labels.en;
       }
-    },
-    [currentProgress],
-  );
+
+      const body = {
+        subject: SUBJECT,
+        topic: CURRENT_TOPIC,
+        difficulty: nextParams.difficulty,
+        activeMisconceptionId: nextParams.misconceptionId,
+        activeMisconceptionDescription,
+        previousQuestionTexts: recentQuestionsRef.current.slice(-5),
+        isTransferQuestion: nextParams.isTransferQuestion,
+        isResetQuestion: nextParams.isResetQuestion,
+      };
+
+      const res = await fetch('/api/quiz/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const data: QuizQuestionData = await res.json();
+      setQuestion(data);
+
+      // Track for de-duplication
+      recentQuestionsRef.current = [
+        ...recentQuestionsRef.current.slice(-9),
+        data.questionText,
+      ];
+    } catch (err) {
+      console.error('[student] fetchQuestion error', err);
+      setQuestionError('Could not load the next question. Please retry.');
+    } finally {
+      setQuestionLoading(false);
+    }
+  }, [language]);
 
   // ── Classify misconception ────────────────────────────────────────────────
 
@@ -675,33 +699,33 @@ export default function StudentPage() {
             questionText: q.questionText,
             correctAnswer: q.options[q.correctOption as keyof typeof q.options],
             studentAnswer: q.options[selectedOption as keyof typeof q.options],
-            subject: currentProgress.subject,
-            topic: currentProgress.currentTopic,
+            subject: SUBJECT,
+            topic: CURRENT_TOPIC,
           }),
         });
 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
 
-        // Look up labels from local data
-        const topicProg = currentProgress.topics[currentProgress.currentTopic];
+        const labels = await fetchMisconceptionLabels(data.misconceptionId as string);
         return {
           misconceptionId: data.misconceptionId,
-          label: topicProg?.activeMisconceptionLabel ?? data.reasoning,
-          label_bm: topicProg?.activeMisconceptionLabel_bm ?? data.reasoning,
+          label: labels.en ?? data.reasoning,
+          label_bm: labels.bm ?? data.reasoning,
         };
       } catch {
         // Fall back to existing active misconception
-        const topicProg = currentProgress.topics[currentProgress.currentTopic];
+        const active = studentProgressRef.current.activeMisconceptions.find(
+          (m) => !m.isCleared,
+        );
         return {
-          misconceptionId: topicProg?.activeMisconceptionId ?? 'unknown',
-          label: topicProg?.activeMisconceptionLabel ?? 'Review this concept carefully.',
-          label_bm:
-            topicProg?.activeMisconceptionLabel_bm ?? 'Semak konsep ini dengan teliti.',
+          misconceptionId: active?.misconceptionId ?? 'unknown',
+          label: 'Review this concept carefully.',
+          label_bm: 'Semak konsep ini dengan teliti.',
         };
       }
     },
-    [currentProgress],
+    [],
   );
 
   // ── onSubmit (from QuizQuestion) ──────────────────────────────────────────
@@ -709,22 +733,13 @@ export default function StudentPage() {
   const handleQuestionSubmit = useCallback(
     async (
       selectedOption: string,
-      confidenceLevel: 'guessed' | 'unsure' | 'knew',
+      confidenceLevel: ConfidenceLevel,
       timeSpentMs: number,
       answerChanges: number,
     ) => {
       if (!question) return;
 
       const isCorrect = selectedOption === question.correctOption;
-
-      // Update streak refs
-      if (isCorrect) {
-        consecutiveCorrectRef.current += 1;
-        lastWasTransferRef.current = question.isTransferQuestion;
-      } else {
-        consecutiveCorrectRef.current = 0;
-        lastWasTransferRef.current = false;
-      }
 
       // Classify misconception if wrong
       let misconceptionId: string | null = null;
@@ -749,32 +764,47 @@ export default function StudentPage() {
         answerChanges,
       });
 
-      // Persist to Firestore
-      const payload: AnswerPayload = {
-        studentId: STUDENT_ID,
+      const answer: Answer = {
+        studentUid: STUDENT_ID,
         classId: CLASS_ID,
-        topic: currentProgress.currentTopic,
+        topic: CURRENT_TOPIC,
         isCorrect,
         isTransferQuestion: question.isTransferQuestion,
-        isResetQuestion: question.isResetQuestion,
-        confidenceLevel,
         misconceptionId,
-        misconceptionLabel,
-        misconceptionLabel_bm,
-        timeSpentMs,
-        answerChanges,
+        confidenceLevel,
       };
 
+      sessionHistoryRef.current = [...sessionHistoryRef.current, answer];
+
+      // Progress read/write goes through the shared service-role route (this
+      // demo student session has no real Supabase Auth session for RLS to
+      // match against).
       try {
-        const updated = await updateStudentProgress(payload);
-        setStudentProgress(updated);
+        const res = await fetch('/api/progress', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            studentId: STUDENT_ID,
+            classId: CLASS_ID,
+            topic: CURRENT_TOPIC,
+            isCorrect,
+            isTransferQuestion: question.isTransferQuestion,
+            misconceptionId,
+            confidenceLevel,
+          }),
+        });
+
+        if (res.ok) {
+          const data: { progress: StudentProgress } = await res.json();
+          setStudentProgress(data.progress);
+        }
       } catch (err) {
         console.error('[student] updateStudentProgress error', err);
       }
 
       setPhase('feedback');
     },
-    [question, currentProgress, classifyMisconception],
+    [question, classifyMisconception],
   );
 
   // ── onNext (from FeedbackCard) ────────────────────────────────────────────
@@ -785,19 +815,35 @@ export default function StudentPage() {
     fetchQuestion();
   }, [fetchQuestion]);
 
-  // ── Firestore realtime subscription ──────────────────────────────────────
+  // ── Initial progress load ─────────────────────────────────────────────────
+  // Goes through the shared service-role route rather than a direct table
+  // read/realtime subscription — this demo student session has no real
+  // Supabase Auth session for `student_progress`'s RLS policies to match
+  // against. Progress otherwise stays in sync via the POST response after
+  // each answer submission (see handleQuestionSubmit).
 
   useEffect(() => {
-    let unsubscribe: (() => void) | null = null;
+    let cancelled = false;
 
-    subscribeStudentProgress(STUDENT_ID, (progress) => {
-      setStudentProgress(progress);
-    }).then((unsub) => {
-      unsubscribe = unsub;
-    });
+    async function loadInitialProgress() {
+      try {
+        const res = await fetch(
+          `/api/progress?studentId=${encodeURIComponent(STUDENT_ID)}&classId=${encodeURIComponent(
+            CLASS_ID,
+          )}&topic=${encodeURIComponent(CURRENT_TOPIC)}`,
+        );
+        if (cancelled || !res.ok) return;
 
+        const data: { progress: StudentProgress } = await res.json();
+        setStudentProgress(data.progress);
+      } catch (err) {
+        console.error('[student] loadInitialProgress error', err);
+      }
+    }
+
+    loadInitialProgress();
     return () => {
-      unsubscribe?.();
+      cancelled = true;
     };
   }, []);
 
@@ -808,57 +854,55 @@ export default function StudentPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Pulse detection ─────────────────────────────────────────────────────
+  // ── Pulse detection — Supabase realtime on `pulses` ──────────────────────
 
   useEffect(() => {
-    let unsubscribe: (() => void) | null = null;
-    let cancelled = false;
+    let currentChannel: RealtimeChannel | null = null;
 
-    (async () => {
-      const { collection, query, where, onSnapshot } = await import(
-        'firebase/firestore'
-      );
-      const db = await getClientFirestore();
+    const channel = supabase
+      .channel(`pulses-${CLASS_ID}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'pulses',
+          filter: `class_id=eq.${CLASS_ID}`,
+        },
+        (payload) => {
+          // Realtime filters only support a single `eq`, so the `status`
+          // condition from the old Firestore query is applied client-side.
+          const row = payload.new as PulseRow | undefined;
 
-      const q = query(
-        collection(db, 'pulses'),
-        where('classId', '==', CLASS_ID),
-        where('status', '==', 'active'),
-      );
+          if (payload.eventType === 'DELETE' || !row || row.status !== 'active') {
+            setActivePulse((prev) => {
+              const deletedRow = payload.old as Partial<PulseRow> | undefined;
+              if (deletedRow && prev && deletedRow.id === prev.id) {
+                setShowPulseOverlay(false);
+                return null;
+              }
+              return prev;
+            });
+            return;
+          }
 
-      unsubscribe = onSnapshot(q, (snapshot) => {
-        if (cancelled) return;
+          setActivePulse((prev) => {
+            if (prev && prev.id === row.id) return prev;
+            setShowPulseToast(true);
+            setShowPulseOverlay(true);
+            setTimeout(() => setShowPulseToast(false), 4000);
+            return row;
+          });
+        },
+      )
+      .subscribe();
 
-        // Find the most recent active pulse. Built via reduce rather than a
-        // `let` mutated inside forEach's callback — TS's control-flow
-        // analysis narrows a captured `let` reassigned inside a nested
-        // closure down to `never` once read back outside it, which reduce's
-        // self-contained accumulator avoids entirely.
-        const latest = snapshot.docs.reduce<PulseDoc | null>((acc, doc) => {
-          const data = doc.data() as PulseDoc;
-          return !acc || data.createdAt > acc.createdAt ? data : acc;
-        }, null);
-
-        if (latest && (!activePulse || latest.pulseId !== activePulse.pulseId)) {
-          setActivePulse(latest);
-          setShowPulseToast(true);
-          setShowPulseOverlay(true);
-
-          // Auto-hide toast after 4 seconds
-          setTimeout(() => setShowPulseToast(false), 4000);
-        } else if (!latest) {
-          setActivePulse(null);
-          setShowPulseOverlay(false);
-        }
-      });
-    })();
+    currentChannel = channel;
 
     return () => {
-      cancelled = true;
-      unsubscribe?.();
+      if (currentChannel) supabase.removeChannel(currentChannel);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePulse?.pulseId]);
+  }, []);
 
   const handlePulseComplete = useCallback(() => {
     setShowPulseOverlay(false);
@@ -950,7 +994,7 @@ export default function StudentPage() {
 
               {/* Progress bar */}
               <MissionProgressBar
-                current={Math.min(missionIndex + 1, TOTAL_MISSIONS)}
+                current={Math.min(MISSION_INDEX + 1, TOTAL_MISSIONS)}
                 total={TOTAL_MISSIONS}
                 language={language}
               />
@@ -1025,6 +1069,7 @@ export default function StudentPage() {
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm px-5 py-5 lg:sticky lg:top-24">
               <MasteryMapPanel
                 progress={studentProgress}
+                activeMisconceptionLabel={activeMisconceptionLabel}
                 language={language}
                 onLanguageToggle={() =>
                   setLanguage((l) => (l === 'en' ? 'bm' : 'en'))
