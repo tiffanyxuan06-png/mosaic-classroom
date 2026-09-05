@@ -5,8 +5,31 @@ import { useRouter } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
 import { signOutUser, useUserRole } from "@/lib/auth";
+import { LanguageProvider, useLanguage } from "@/lib/LanguageContext";
 
-export default function TeacherLayout({ children }: { children: ReactNode }) {
+function TeacherHeader({ className, name, onSignOut }: { className: string; name: string | null; onSignOut: () => void }) {
+  const { language, toggleLanguage } = useLanguage();
+
+  return (
+    <header className="grid grid-cols-3 items-center border-b px-6 py-4">
+      <span className="text-lg font-semibold">🎓 Mosaic Classroom</span>
+      <span className="text-center text-sm font-medium text-muted-foreground">
+        {className}
+      </span>
+      <div className="flex items-center justify-end gap-3">
+        <Button variant="ghost" size="sm" onClick={toggleLanguage}>
+          {language === "en" ? "EN | BM" : "BM | EN"}
+        </Button>
+        <span className="text-sm text-muted-foreground">{name ?? "Teacher"}</span>
+        <Button variant="outline" size="sm" onClick={onSignOut}>
+          Sign Out
+        </Button>
+      </div>
+    </header>
+  );
+}
+
+function TeacherLayoutContent({ children }: { children: ReactNode }) {
   const router = useRouter();
   const { uid, role, name, profile, loading } = useUserRole();
 
@@ -33,19 +56,16 @@ export default function TeacherLayout({ children }: { children: ReactNode }) {
 
   return (
     <div className="min-h-screen">
-      <header className="grid grid-cols-3 items-center border-b px-6 py-4">
-        <span className="text-lg font-semibold">🎓 Mosaic Classroom</span>
-        <span className="text-center text-sm font-medium text-muted-foreground">
-          {className}
-        </span>
-        <div className="flex items-center justify-end gap-3">
-          <span className="text-sm text-muted-foreground">{name ?? "Teacher"}</span>
-          <Button variant="outline" size="sm" onClick={handleSignOut}>
-            Sign Out
-          </Button>
-        </div>
-      </header>
+      <TeacherHeader className={className} name={name} onSignOut={handleSignOut} />
       <main>{children}</main>
     </div>
+  );
+}
+
+export default function TeacherLayout({ children }: { children: ReactNode }) {
+  return (
+    <LanguageProvider>
+      <TeacherLayoutContent>{children}</TeacherLayoutContent>
+    </LanguageProvider>
   );
 }
