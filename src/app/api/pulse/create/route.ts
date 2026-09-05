@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase-admin';
+import { supabaseAdmin, requireSupabaseAdmin } from '@/lib/supabase-admin';
 import { callGemini, parseGeminiJSON } from '@/lib/gemini';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -257,6 +257,9 @@ async function generateDiagnosticQuestion(
 const PULSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 export async function POST(request: NextRequest) {
+  const notConfigured = requireSupabaseAdmin();
+  if (notConfigured) return notConfigured;
+
   try {
     // 1 — Parse & validate
     const body: unknown = await request.json();

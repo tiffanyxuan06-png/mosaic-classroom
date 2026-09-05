@@ -35,7 +35,11 @@ export default function KioskEntryPage() {
       const res = await fetch(`/api/kiosk/lookup?code=${encodeURIComponent(kioskCode)}`);
 
       if (!res.ok) {
-        setError("No class found with that code. Check with your teacher.");
+        setError(
+          res.status === 503
+            ? "The server is not set up yet. Ask your teacher to check the app configuration."
+            : "No class found with that code. Check with your teacher.",
+        );
         return;
       }
 

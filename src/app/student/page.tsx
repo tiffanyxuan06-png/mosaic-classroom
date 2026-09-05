@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { RealtimeChannel } from '@supabase/supabase-js';
 import QuizQuestion, { type QuizQuestionData } from '@/components/QuizQuestion';
+import { useLanguage } from '@/lib/LanguageContext';
 import FeedbackCard from '@/components/FeedbackCard';
 import { supabase } from '@/lib/supabase-client';
 import {
@@ -575,7 +576,8 @@ function PulseQuizOverlay({
 
 export default function StudentPage() {
   // ── State ─────────────────────────────────────────────────────────────────
-  const [language, setLanguage] = useState<Language>('en');
+  // Shared with the layout header's EN | BM toggle via LanguageContext.
+  const { language, toggleLanguage } = useLanguage();
   const [phase, setPhase] = useState<PhaseType>('question');
 
   const [question, setQuestion] = useState<QuizQuestionData | null>(null);
@@ -1071,9 +1073,7 @@ export default function StudentPage() {
                 progress={studentProgress}
                 activeMisconceptionLabel={activeMisconceptionLabel}
                 language={language}
-                onLanguageToggle={() =>
-                  setLanguage((l) => (l === 'en' ? 'bm' : 'en'))
-                }
+                onLanguageToggle={toggleLanguage}
               />
             </div>
           </aside>

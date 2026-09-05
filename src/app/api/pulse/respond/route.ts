@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { supabaseAdmin, requireSupabaseAdmin } from "@/lib/supabase-admin";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pulse responses are written from the student page, which (in its current
@@ -33,6 +33,9 @@ function isValidBody(body: unknown): body is PostBody {
 }
 
 export async function POST(request: NextRequest) {
+  const notConfigured = requireSupabaseAdmin();
+  if (notConfigured) return notConfigured;
+
   const body: unknown = await request.json();
 
   if (!isValidBody(body)) {

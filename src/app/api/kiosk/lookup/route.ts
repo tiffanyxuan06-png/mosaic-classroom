@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { supabaseAdmin, requireSupabaseAdmin } from "@/lib/supabase-admin";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Resolving a kiosk code to a class happens before anyone is signed in, so an
@@ -9,6 +9,9 @@ import { supabaseAdmin } from "@/lib/supabase-admin";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function GET(request: NextRequest) {
+  const notConfigured = requireSupabaseAdmin();
+  if (notConfigured) return notConfigured;
+
   const { searchParams } = new URL(request.url);
   const code = searchParams.get("code");
 

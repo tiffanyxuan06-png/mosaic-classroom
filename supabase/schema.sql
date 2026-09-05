@@ -175,6 +175,31 @@ alter table scanned_answers enable row level security;
 create policy "profiles_select_own" on profiles
   for select using (auth.uid() = id);
 
+-- profiles: a teacher can read every profile in a class they teach.
+-- The helper is security definer so this policy does not recurse through
+-- classes_select_member (which itself reads profiles).
+create or replace function public.is_teacher_of_class(target_class_id text)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from classes
+    where classes.id = target_class_id
+      and classes.teacher_id = auth.uid()
+  );
+$$;
+
+revoke all on function public.is_teacher_of_class(text) from public;
+grant execute on function public.is_teacher_of_class(text) to authenticated;
+
+create policy "profiles_select_class_teacher" on profiles
+  for select using (
+    class_id is not null and public.is_teacher_of_class(class_id)
+  );
+
 -- classes: any authenticated user in that class (student or teacher) can read it
 create policy "classes_select_member" on classes
   for select using (

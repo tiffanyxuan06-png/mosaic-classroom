@@ -73,7 +73,7 @@ const FALLBACK_QUESTIONS: Record<string, GeneratedQuestion[]> = {
       isResetQuestion: false,
     },
   ],
-  'Fractions': [
+  'fractions': [
     {
       questionId: 'fallback_fractions_1',
       questionText: 'What is 1/2 + 1/3?',

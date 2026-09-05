@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { supabaseAdmin, requireSupabaseAdmin } from "@/lib/supabase-admin";
 import { updateStudentProgress, type Answer, type ConfidenceLevel } from "@/lib/helpers";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +53,9 @@ function paperStudentId(classId: string, studentIdentifier: string): string {
 const DEFAULT_CONFIDENCE: ConfidenceLevel = "unsure";
 
 export async function POST(request: NextRequest) {
+  const notConfigured = requireSupabaseAdmin();
+  if (notConfigured) return notConfigured;
+
   const body: unknown = await request.json();
 
   if (!isValidBody(body)) {

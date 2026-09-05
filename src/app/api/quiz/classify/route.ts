@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase-admin';
+import { supabaseAdmin, requireSupabaseAdmin } from '@/lib/supabase-admin';
 import { callGemini, parseGeminiJSON } from '@/lib/gemini';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -150,6 +150,9 @@ Return ONLY valid JSON, no markdown:
 // ────────────────────────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
+  const notConfigured = requireSupabaseAdmin();
+  if (notConfigured) return notConfigured;
+
   try {
     // 1 — Parse & validate request body
     const body: unknown = await request.json();

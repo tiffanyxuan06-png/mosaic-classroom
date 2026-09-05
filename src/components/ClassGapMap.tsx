@@ -18,6 +18,8 @@ export interface ClassGapMapProps {
   classId: string;
   topics: string[];
   language: 'en' | 'bm';
+  /** studentId → display name. Rows fall back to the raw id when missing. */
+  studentNames?: Record<string, string>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +173,7 @@ function buildStudentRows(
   // comment further down). Kept as a real param so the caller doesn't need
   // to change once bilingual labels are wired in.
   _language: 'en' | 'bm',
+  studentNames?: Record<string, string>,
 ): StudentRow[] {
   // Group by studentUid
   const byStudent = new Map<string, StudentProgress[]>();
@@ -237,7 +240,7 @@ function buildStudentRows(
 
     rows.push({
       studentId,
-      displayName: studentId, // Will be enriched when student profile exists
+      displayName: studentNames?.[studentId] ?? studentId,
       urgencyScore: Math.round(totalUrgency * 100) / 100,
       topicMap,
       progressDocs: progressList,
@@ -643,6 +646,7 @@ export default function ClassGapMap({
   classId,
   topics,
   language,
+  studentNames,
 }: ClassGapMapProps) {
   const t = COPY[language];
   const { docs, loading } = useClassProgress(classId);
@@ -655,7 +659,7 @@ export default function ClassGapMap({
 
   // Build & sort rows
   const rows = useMemo(() => {
-    const built = buildStudentRows(docs, topics, language);
+    const built = buildStudentRows(docs, topics, language, studentNames);
     if (sortMode === 'priority') {
       built.sort((a, b) => b.urgencyScore - a.urgencyScore);
     } else {
@@ -664,7 +668,7 @@ export default function ClassGapMap({
       );
     }
     return built;
-  }, [docs, topics, language, sortMode]);
+  }, [docs, topics, language, sortMode, studentNames]);
 
   const handleCellClick = useCallback((student: StudentRow) => {
     setSelectedStudent(student);

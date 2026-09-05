@@ -6,12 +6,14 @@ import { Menu, X } from 'lucide-react';
 
 import { supabase } from '@/lib/supabase-client';
 import { useUserRole } from '@/lib/auth';
+import { useLanguage } from '@/lib/LanguageContext';
 import type { StudentProgress as HelpersStudentProgress } from '@/lib/helpers';
 import type { StudentTier as MasteryTier } from '@/lib/helpers';
 
 import ActionCard from '@/components/ActionCard';
 import ClassGapMap from '@/components/ClassGapMap';
 import PaperScanner from '@/components/PaperScanner';
+import { generateCapsuleHTML, type CapsuleResponse } from '@/lib/capsuleHtml';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Pulse types and components
@@ -269,8 +271,6 @@ function PulseResultsOverlay({
 // Types
 // ────────────────────────────────────────────────────────────────────────────
 
-type Language = 'en' | 'bm';
-
 interface ClassData {
   classId: string;
   name: string;
@@ -371,19 +371,95 @@ function pulseResponseRowToPulseResponse(row: Record<string, unknown>): PulseRes
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Capsule helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+interface MisconceptionDetails {
+  id: string;
+  name: string;
+  topic: string;
+  wrongAnswerPattern: string;
+  remediationApproach: string;
+}
+
+/** Load the fields /api/capsule/generate needs for one misconception. */
+async function fetchMisconceptionDetails(
+  misconceptionId: string,
+): Promise<MisconceptionDetails | null> {
+  const { data, error } = await supabase
+    .from('misconceptions')
+    .select('id, name, topic, wrong_answer_pattern, remediation_approach')
+    .eq('id', misconceptionId)
+    .maybeSingle();
+  if (error || !data) return null;
+  return {
+    id: data.id as string,
+    name: (data.name as string) || misconceptionId,
+    topic: data.topic as string,
+    wrongAnswerPattern:
+      (data.wrong_answer_pattern as string | null) || 'Applies the rule incorrectly.',
+    remediationApproach:
+      (data.remediation_approach as string | null) ||
+      'Work through worked examples step by step, then practise similar items.',
+  };
+}
+
+/**
+ * Pick the misconception a capsule should target: the most frequent uncleared
+ * one across the given progress rows, ties broken by persistence.
+ */
+function pickTargetMisconception(progressRows: HelpersStudentProgress[]): string | null {
+  const counts = new Map<string, { count: number; persistence: number }>();
+  for (const progress of progressRows) {
+    for (const m of progress.activeMisconceptions) {
+      if (m.isCleared) continue;
+      const entry = counts.get(m.misconceptionId) ?? { count: 0, persistence: 0 };
+      entry.count += 1;
+      entry.persistence = Math.max(entry.persistence, m.persistenceScore);
+      counts.set(m.misconceptionId, entry);
+    }
+  }
+  let best: string | null = null;
+  let bestScore = -1;
+  counts.forEach((entry, id) => {
+    const score = entry.count * 10 + entry.persistence;
+    if (score > bestScore) {
+      bestScore = score;
+      best = id;
+    }
+  });
+  return best;
+}
+
+/** Trigger a browser download of a generated capsule as a printable HTML file. */
+function downloadCapsuleHtml(capsule: CapsuleResponse, fileName: string, studentName?: string) {
+  const html = generateCapsuleHTML(capsule, studentName);
+  const blob = new Blob([html], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Main Component
 // ────────────────────────────────────────────────────────────────────────────
 
 export default function TeacherDashboard() {
   // Auth & navigation
   const { uid, loading: authLoading } = useUserRole();
-  const [language, setLanguage] = useState<Language>('en');
+  // Shared with the layout header's EN | BM toggle via LanguageContext.
+  const { language, setLanguage } = useLanguage();
 
   // Class data
   const [classData, setClassData] = useState<ClassData | null>(null);
   const [studentProgress, setStudentProgress] = useState<Map<string, HelpersStudentProgress>>(
     new Map(),
   );
+  /** student uid → display name, loaded from `profiles` for this class. */
+  const [studentNames, setStudentNames] = useState<Record<string, string>>({});
 
   // UI state
   const [selectedStudent, setSelectedStudent] = useState<StudentForPanel | null>(null);
@@ -401,6 +477,12 @@ export default function TeacherDashboard() {
 
   // Paper scanner state
   const [scannerOpen, setScannerOpen] = useState(false);
+
+  /** Show a transient message in the top toast (shared with pulse). */
+  const showToast = useCallback((message: string) => {
+    setPulseToast(message);
+    setTimeout(() => setPulseToast(null), 4000);
+  }, []);
 
   // Demo: using a hardcoded classId until class selection/routing exists.
   const CLASS_ID = 'class_demo_01';
@@ -615,6 +697,39 @@ export default function TeacherDashboard() {
   }, []);
 
   // ──────────────────────────────────────────────────────────────────────────
+  // Load the class roster (student names) so the gap map, intervention
+  // groups and detail panel can show names instead of raw uids.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!CLASS_ID) return;
+
+    let cancelled = false;
+
+    supabase
+      .from('profiles')
+      .select('id, name')
+      .eq('class_id', CLASS_ID)
+      .eq('role', 'student')
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error('[teacher] Error loading student names:', error);
+          return;
+        }
+        const names: Record<string, string> = {};
+        for (const row of data ?? []) {
+          if (row.id && row.name) names[row.id as string] = row.name as string;
+        }
+        setStudentNames(names);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // ──────────────────────────────────────────────────────────────────────────
   // Group progress rows by student uid (one entry per student, all topics)
   // ──────────────────────────────────────────────────────────────────────────
 
@@ -682,27 +797,27 @@ export default function TeacherDashboard() {
         if (avgScore < 90) {
           groups.green.students.push({
             uid: studentUid,
-            name: studentUid,
+            name: studentNames[studentUid] ?? studentUid,
             masteryScore: Math.round(avgScore),
           });
         } else {
           groups.blue.students.push({
             uid: studentUid,
-            name: studentUid,
+            name: studentNames[studentUid] ?? studentUid,
             masteryScore: Math.round(avgScore),
           });
         }
       } else {
         groups[worstTier].students.push({
           uid: studentUid,
-          name: studentUid,
+          name: studentNames[studentUid] ?? studentUid,
           masteryScore: 50, // placeholder
         });
       }
     });
 
     return [groups.red, groups.yellow, groups.green, groups.blue];
-  }, [progressByStudent]);
+  }, [progressByStudent, studentNames]);
 
   // ──────────────────────────────────────────────────────────────────────────
   // Handler: Toggle kiosk mode
@@ -729,30 +844,47 @@ export default function TeacherDashboard() {
   const handleGenerateClassSlip = async (tier: MasteryTier) => {
     if (!classData) return;
 
+    const group = getInterventionGroups().find((g) => g.tier === tier);
+    const rows = (group?.students ?? []).flatMap(
+      (student) => progressByStudent.get(student.uid) ?? [],
+    );
+    const misconceptionId = pickTargetMisconception(rows);
+    if (!misconceptionId) {
+      showToast(
+        language === 'en'
+          ? 'No active misconception to build a slip from'
+          : 'Tiada miskonsepsi aktif untuk slip ini',
+      );
+      return;
+    }
+
     try {
+      const details = await fetchMisconceptionDetails(misconceptionId);
+      if (!details) throw new Error(`Misconception ${misconceptionId} not found`);
+
       const response = await fetch('/api/capsule/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          classId: CLASS_ID,
-          subject: classData.subject,
-          topic: classData.topics[0], // First topic for now
-          tier,
           mode: 'class_slip',
+          misconceptionId: details.id,
+          misconceptionName: details.name,
+          wrongAnswerPattern: details.wrongAnswerPattern,
+          remediationApproach: details.remediationApproach,
+          subject: classData.subject,
+          topic: details.topic || classData.topics[0],
+          questionCount: 3,
         }),
       });
 
-      if (!response.ok) throw new Error('Failed to generate class slip');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `class_slip_${tier}.html`;
-      a.click();
-      URL.revokeObjectURL(url);
+      const capsule: CapsuleResponse = await response.json();
+      downloadCapsuleHtml(capsule, `class_slip_${tier}_${details.id}.html`);
+      showToast(language === 'en' ? '✓ Class slip downloaded' : '✓ Slip kelas dimuat turun');
     } catch (error) {
       console.error('[teacher] Error generating class slip:', error);
+      showToast(language === 'en' ? 'Failed to generate class slip' : 'Gagal menjana slip kelas');
     }
   };
 
@@ -775,7 +907,7 @@ export default function TeacherDashboard() {
 
       setSelectedStudent({
         uid: studentUid,
-        name: (profileRow?.name as string | undefined) || 'Unknown',
+        name: (profileRow?.name as string | undefined) || studentNames[studentUid] || 'Unknown',
         email: (profileRow?.email as string | undefined) || '',
         progressByTopic: progressList,
       });
@@ -792,30 +924,44 @@ export default function TeacherDashboard() {
   const handleGenerateIndividualCapsule = async () => {
     if (!selectedStudent || !classData) return;
 
+    const misconceptionId = pickTargetMisconception(selectedStudent.progressByTopic);
+    if (!misconceptionId) {
+      showToast(
+        language === 'en'
+          ? 'This student has no active misconception'
+          : 'Pelajar ini tiada miskonsepsi aktif',
+      );
+      return;
+    }
+
     try {
+      const details = await fetchMisconceptionDetails(misconceptionId);
+      if (!details) throw new Error(`Misconception ${misconceptionId} not found`);
+
       const response = await fetch('/api/capsule/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          studentUid: selectedStudent.uid,
-          classId: CLASS_ID,
-          subject: classData.subject,
-          topic: classData.topics[0],
           mode: 'individual',
+          misconceptionId: details.id,
+          misconceptionName: details.name,
+          wrongAnswerPattern: details.wrongAnswerPattern,
+          remediationApproach: details.remediationApproach,
+          subject: classData.subject,
+          topic: details.topic || classData.topics[0],
+          questionCount: 5,
+          studentName: selectedStudent.name,
         }),
       });
 
-      if (!response.ok) throw new Error('Failed to generate capsule');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `capsule_${selectedStudent.uid}.html`;
-      a.click();
-      URL.revokeObjectURL(url);
+      const capsule: CapsuleResponse = await response.json();
+      downloadCapsuleHtml(capsule, `capsule_${selectedStudent.uid}.html`, selectedStudent.name);
+      showToast(language === 'en' ? '✓ Capsule downloaded' : '✓ Kapsul dimuat turun');
     } catch (error) {
       console.error('[teacher] Error generating capsule:', error);
+      showToast(language === 'en' ? 'Failed to generate capsule' : 'Gagal menjana kapsul');
     }
   };
 
@@ -993,6 +1139,7 @@ export default function TeacherDashboard() {
                   classId={CLASS_ID}
                   topics={classData.topics || ['fractions', 'decimals', 'percentages']}
                   language={language}
+                  studentNames={studentNames}
                 />
               </div>
             </section>
@@ -1071,7 +1218,7 @@ export default function TeacherDashboard() {
               animate={{ x: 0, opacity: 1 }}
               exit={{ x: 400, opacity: 0 }}
               transition={{ type: 'spring', stiffness: 300, damping: 30 }}
-              className="relative w-80 border-l border-slate-200 bg-white shadow-lg"
+              className="relative z-40 w-80 border-l border-slate-200 bg-white shadow-lg"
             >
               {/* Header */}
               <div className="flex items-center justify-between border-b border-slate-200 p-4">

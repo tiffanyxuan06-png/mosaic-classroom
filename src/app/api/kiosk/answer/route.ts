@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { supabaseAdmin, requireSupabaseAdmin } from "@/lib/supabase-admin";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/kiosk/answer — raw kiosk answer log, separate from the progress
@@ -30,6 +30,9 @@ function isValidBody(body: unknown): body is PostBody {
 }
 
 export async function POST(request: NextRequest) {
+  const notConfigured = requireSupabaseAdmin();
+  if (notConfigured) return notConfigured;
+
   const body: unknown = await request.json();
 
   if (!isValidBody(body)) {

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { supabaseAdmin, requireSupabaseAdmin } from "@/lib/supabase-admin";
 import {
   updateStudentProgress,
   type ActiveMisconception,
@@ -76,6 +76,9 @@ async function loadProgress(
 // ────────────────────────────────────────────────────────────────────────────
 
 export async function GET(request: NextRequest) {
+  const notConfigured = requireSupabaseAdmin();
+  if (notConfigured) return notConfigured;
+
   const { searchParams } = new URL(request.url);
   const studentId = searchParams.get("studentId");
   const classId = searchParams.get("classId");
@@ -130,6 +133,9 @@ function isValidBody(body: unknown): body is PostBody {
 }
 
 export async function POST(request: NextRequest) {
+  const notConfigured = requireSupabaseAdmin();
+  if (notConfigured) return notConfigured;
+
   const body: unknown = await request.json();
 
   if (!isValidBody(body)) {
