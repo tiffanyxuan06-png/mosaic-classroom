@@ -1,6 +1,6 @@
-import { getApps, initializeApp, type FirebaseOptions } from "firebase/app";
-import { getAuth } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
+import { getApps, initializeApp, type FirebaseApp, type FirebaseOptions } from "firebase/app";
+import { getAuth, type Auth } from "firebase/auth";
+import { getFirestore, type Firestore } from "firebase/firestore";
 
 const firebaseConfig: FirebaseOptions = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -11,9 +11,20 @@ const firebaseConfig: FirebaseOptions = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-export const firebaseApp = getApps().length
-  ? getApps()[0]
-  : initializeApp(firebaseConfig);
+let app: FirebaseApp | undefined;
+let authObj: Auth | undefined;
+let dbObj: Firestore | undefined;
 
-export const auth = getAuth(firebaseApp);
-export const db = getFirestore(firebaseApp);
+try {
+  app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
+  if (app) {
+    authObj = getAuth(app);
+    dbObj = getFirestore(app);
+  }
+} catch (error) {
+  console.warn("Firebase client init warning:", error);
+}
+
+export const firebaseApp = app;
+export const auth = (authObj ?? {}) as Auth;
+export const db = (dbObj ?? {}) as Firestore;
