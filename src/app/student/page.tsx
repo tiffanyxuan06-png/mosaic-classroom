@@ -1,0 +1,737 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import QuizQuestion, { type QuizQuestionData } from '@/components/QuizQuestion';
+import FeedbackCard from '@/components/FeedbackCard';
+import {
+  updateStudentProgress,
+  subscribeStudentProgress,
+  getNextQuestionParams,
+  makeDefaultProgress,
+  DEFAULT_TOPICS,
+  type StudentProgress,
+  type TopicProgress,
+  type MasteryTier,
+  type AnswerPayload,
+} from '@/lib/studentProgress';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Demo student — in production this comes from auth
+const STUDENT_ID = 'demo_student_001';
+const CLASS_ID = 'class_6A';
+const TOTAL_MISSIONS = 4;
+
+const MISSIONS: Record<number, { label_en: string; label_bm: string }> = {
+  0: {
+    label_en: 'Mission 1: Build equivalent fractions',
+    label_bm: 'Misi 1: Bina pecahan setara',
+  },
+  1: {
+    label_en: 'Mission 2: Add fractions with different denominators',
+    label_bm: 'Misi 2: Tambah pecahan berlainan penyebut',
+  },
+  2: {
+    label_en: 'Mission 3: Solve a real-world measurement problem',
+    label_bm: 'Misi 3: Selesaikan masalah pengukuran dunia nyata',
+  },
+  3: {
+    label_en: 'Mission 4: Challenge — advanced applications',
+    label_bm: 'Misi 4: Cabaran — aplikasi lanjutan',
+  },
+};
+
+type Language = 'en' | 'bm';
+type PhaseType = 'question' | 'feedback';
+
+interface AnswerState {
+  selectedOption: string;
+  isCorrect: boolean;
+  misconceptionId: string | null;
+  misconceptionLabel: string | null;
+  misconceptionLabel_bm: string | null;
+  confidenceLevel: 'guessed' | 'unsure' | 'knew';
+  timeSpentMs: number;
+  answerChanges: number;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility
+// ─────────────────────────────────────────────────────────────────────────────
+
+function cn(...classes: (string | false | null | undefined)[]): string {
+  return classes.filter(Boolean).join(' ');
+}
+
+const TIER_STYLES: Record<
+  MasteryTier,
+  { dot: string; badge: string; label_en: string; label_bm: string }
+> = {
+  red: {
+    dot: 'bg-red-500',
+    badge: 'bg-red-100 border-red-200 text-red-700',
+    label_en: 'Needs support',
+    label_bm: 'Perlu sokongan',
+  },
+  yellow: {
+    dot: 'bg-yellow-400',
+    badge: 'bg-yellow-50 border-yellow-200 text-yellow-700',
+    label_en: 'Developing',
+    label_bm: 'Sedang berkembang',
+  },
+  green: {
+    dot: 'bg-green-500',
+    badge: 'bg-green-50 border-green-200 text-green-700',
+    label_en: 'Mastered',
+    label_bm: 'Dikuasai',
+  },
+  blue: {
+    dot: 'bg-blue-500',
+    badge: 'bg-blue-50 border-blue-200 text-blue-700',
+    label_en: 'Advanced',
+    label_bm: 'Lanjutan',
+  },
+};
+
+const TOPIC_DISPLAY: Record<string, { en: string; bm: string }> = {
+  fractions: { en: 'Fractions', bm: 'Pecahan' },
+  decimals: { en: 'Decimals', bm: 'Perpuluhan' },
+  percentages: { en: 'Percentages', bm: 'Peratusan' },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-component: Mission progress bar
+// ─────────────────────────────────────────────────────────────────────────────
+
+function MissionProgressBar({
+  current,
+  total,
+  language,
+}: {
+  current: number;
+  total: number;
+  language: Language;
+}) {
+  const pct = Math.min(100, Math.round((current / total) * 100));
+  const label =
+    language === 'bm'
+      ? `Misi ${current} daripada ${total}`
+      : `Mission ${current} of ${total}`;
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+        <span>{label}</span>
+        <span>{pct}%</span>
+      </div>
+      <div className="h-2 w-full rounded-full bg-slate-100 overflow-hidden">
+        <motion.div
+          className="h-full rounded-full bg-gradient-to-r from-blue-500 to-violet-500"
+          initial={{ width: 0 }}
+          animate={{ width: `${pct}%` }}
+          transition={{ duration: 0.6, ease: 'easeOut' }}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-component: Topic mastery card
+// ─────────────────────────────────────────────────────────────────────────────
+
+function TopicMasteryCard({
+  topicProgress,
+  language,
+  isActive,
+}: {
+  topicProgress: TopicProgress;
+  language: Language;
+  isActive: boolean;
+}) {
+  const tier = topicProgress.tier;
+  const styles = TIER_STYLES[tier];
+  const topicName =
+    TOPIC_DISPLAY[topicProgress.topic]?.[language] ?? topicProgress.topic;
+  const misconceptionText =
+    language === 'bm'
+      ? topicProgress.activeMisconceptionLabel_bm
+      : topicProgress.activeMisconceptionLabel;
+
+  return (
+    <motion.div
+      layout
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={cn(
+        'rounded-xl border-2 p-4 transition-shadow duration-200',
+        styles.badge,
+        isActive && 'ring-2 ring-blue-400 ring-offset-2',
+      )}
+    >
+      {/* Header row */}
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <span className="font-semibold text-sm leading-tight">{topicName}</span>
+        <span
+          className={cn(
+            'flex-shrink-0 w-3 h-3 rounded-full',
+            styles.dot,
+          )}
+          title={tier.toUpperCase()}
+          aria-label={`${tier} tier`}
+        />
+      </div>
+
+      {/* Tier label */}
+      <p className="text-xs font-medium uppercase tracking-wide opacity-70 mb-1.5">
+        {tier === 'red' || tier === 'yellow'
+          ? tier.toUpperCase()
+          : tier === 'green'
+          ? language === 'bm'
+            ? '✓ Dikuasai'
+            : '✓ Mastered'
+          : language === 'bm'
+          ? '⭐ Lanjutan'
+          : '⭐ Advanced'}
+      </p>
+
+      {/* Misconception hint */}
+      {(tier === 'red' || tier === 'yellow') && misconceptionText && (
+        <p className="text-[11px] leading-snug opacity-80 italic line-clamp-2">
+          "{misconceptionText}"
+        </p>
+      )}
+
+      {/* Questions attempted */}
+      <p className="text-[10px] mt-2 opacity-50">
+        {topicProgress.questionsAttempted}{' '}
+        {language === 'bm' ? 'soalan dijawab' : 'questions answered'}
+      </p>
+    </motion.div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-component: Mastery Map panel
+// ─────────────────────────────────────────────────────────────────────────────
+
+function MasteryMapPanel({
+  progress,
+  language,
+  onLanguageToggle,
+}: {
+  progress: StudentProgress | null;
+  language: Language;
+  onLanguageToggle: () => void;
+}) {
+  const topics = progress
+    ? Object.values(progress.topics)
+    : DEFAULT_TOPICS;
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Panel header */}
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h2 className="text-base font-bold text-slate-800">
+            {language === 'bm' ? 'Peta Penguasaan' : 'Mastery Map'}
+          </h2>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {language === 'bm'
+              ? 'Kemas kini masa nyata'
+              : 'Updates in real time'}
+          </p>
+        </div>
+
+        {/* Language toggle */}
+        <button
+          type="button"
+          id="language-toggle"
+          onClick={onLanguageToggle}
+          className={cn(
+            'flex items-center gap-1.5 px-3 py-1.5 rounded-full border-2 text-xs font-bold',
+            'transition-all duration-200',
+            language === 'bm'
+              ? 'border-blue-500 bg-blue-50 text-blue-700'
+              : 'border-slate-300 bg-white text-slate-600 hover:border-blue-300',
+          )}
+          aria-label="Toggle language"
+        >
+          <span
+            className={cn(
+              'transition-opacity',
+              language === 'en' ? 'opacity-100' : 'opacity-40',
+            )}
+          >
+            EN
+          </span>
+          <span className="opacity-30">/</span>
+          <span
+            className={cn(
+              'transition-opacity',
+              language === 'bm' ? 'opacity-100' : 'opacity-40',
+            )}
+          >
+            BM
+          </span>
+        </button>
+      </div>
+
+      {/* Tier legend */}
+      <div className="flex flex-wrap gap-2 mb-4">
+        {(
+          [
+            ['red', '#ef4444'],
+            ['yellow', '#facc15'],
+            ['green', '#22c55e'],
+            ['blue', '#3b82f6'],
+          ] as const
+        ).map(([tier, color]) => (
+          <div key={tier} className="flex items-center gap-1 text-[10px] text-slate-500">
+            <span
+              className="w-2 h-2 rounded-full flex-shrink-0"
+              style={{ background: color }}
+            />
+            {tier.toUpperCase()}
+          </div>
+        ))}
+      </div>
+
+      {/* Topic cards grid */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-3 overflow-y-auto flex-1 pr-1">
+        <AnimatePresence mode="popLayout">
+          {topics.map((t) => (
+            <TopicMasteryCard
+              key={t.topic}
+              topicProgress={t}
+              language={language}
+              isActive={progress?.currentTopic === t.topic}
+            />
+          ))}
+        </AnimatePresence>
+      </div>
+
+      {/* Realtime indicator */}
+      <div className="flex items-center gap-1.5 mt-4 pt-3 border-t border-slate-100">
+        <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+        <span className="text-[10px] text-slate-400">
+          {language === 'bm' ? 'Tersambung ke Firestore' : 'Live — Firestore connected'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-component: Error banner
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ErrorBanner({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="rounded-xl border-2 border-red-200 bg-red-50 px-5 py-4 flex items-center justify-between gap-4">
+      <p className="text-sm text-red-700 font-medium">{message}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="flex-shrink-0 text-sm font-semibold text-red-700 underline underline-offset-2"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main page
+// ─────────────────────────────────────────────────────────────────────────────
+
+export default function StudentPage() {
+  // ── State ─────────────────────────────────────────────────────────────────
+  const [language, setLanguage] = useState<Language>('en');
+  const [phase, setPhase] = useState<PhaseType>('question');
+
+  const [question, setQuestion] = useState<QuizQuestionData | null>(null);
+  const [questionLoading, setQuestionLoading] = useState(true);
+  const [questionError, setQuestionError] = useState<string | null>(null);
+
+  const [answerState, setAnswerState] = useState<AnswerState | null>(null);
+
+  const [studentProgress, setStudentProgress] =
+    useState<StudentProgress | null>(null);
+
+  // Tracking refs across question chain
+  const consecutiveCorrectRef = useRef(0);
+  const lastWasTransferRef = useRef(false);
+  const recentQuestionsRef = useRef<string[]>([]);
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  const currentProgress =
+    studentProgress ?? makeDefaultProgress(STUDENT_ID, CLASS_ID);
+
+  const missionIndex = currentProgress.currentMissionIndex ?? 0;
+  const missionLabel =
+    language === 'bm'
+      ? MISSIONS[missionIndex]?.label_bm
+      : MISSIONS[missionIndex]?.label_en;
+
+  const currentTopicProgress =
+    currentProgress.topics[currentProgress.currentTopic];
+  const isBlue = currentTopicProgress?.tier === 'blue';
+
+  // ── Fetch question ─────────────────────────────────────────────────────────
+
+  const fetchQuestion = useCallback(
+    async (params?: Partial<Parameters<typeof getNextQuestionParams>[0]>) => {
+      setQuestionLoading(true);
+      setQuestionError(null);
+
+      try {
+        const nextParams = getNextQuestionParams(
+          currentProgress,
+          consecutiveCorrectRef.current > 0,
+          lastWasTransferRef.current,
+          consecutiveCorrectRef.current,
+          recentQuestionsRef.current,
+        );
+
+        const body = {
+          ...nextParams,
+          previousQuestionTexts: recentQuestionsRef.current.slice(-5),
+          ...params,
+        };
+
+        const res = await fetch('/api/quiz/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const data: QuizQuestionData = await res.json();
+        setQuestion(data);
+
+        // Track for de-duplication
+        recentQuestionsRef.current = [
+          ...recentQuestionsRef.current.slice(-9),
+          data.questionText,
+        ];
+      } catch (err) {
+        console.error('[student] fetchQuestion error', err);
+        setQuestionError('Could not load the next question. Please retry.');
+      } finally {
+        setQuestionLoading(false);
+      }
+    },
+    [currentProgress],
+  );
+
+  // ── Classify misconception ────────────────────────────────────────────────
+
+  const classifyMisconception = useCallback(
+    async (
+      q: QuizQuestionData,
+      selectedOption: string,
+    ): Promise<{ misconceptionId: string; label: string; label_bm: string }> => {
+      try {
+        const res = await fetch('/api/quiz/classify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            questionText: q.questionText,
+            correctAnswer: q.options[q.correctOption as keyof typeof q.options],
+            studentAnswer: q.options[selectedOption as keyof typeof q.options],
+            subject: currentProgress.subject,
+            topic: currentProgress.currentTopic,
+          }),
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        // Look up labels from local data
+        const topicProg = currentProgress.topics[currentProgress.currentTopic];
+        return {
+          misconceptionId: data.misconceptionId,
+          label: topicProg?.activeMisconceptionLabel ?? data.reasoning,
+          label_bm: topicProg?.activeMisconceptionLabel_bm ?? data.reasoning,
+        };
+      } catch {
+        // Fall back to existing active misconception
+        const topicProg = currentProgress.topics[currentProgress.currentTopic];
+        return {
+          misconceptionId: topicProg?.activeMisconceptionId ?? 'unknown',
+          label: topicProg?.activeMisconceptionLabel ?? 'Review this concept carefully.',
+          label_bm:
+            topicProg?.activeMisconceptionLabel_bm ?? 'Semak konsep ini dengan teliti.',
+        };
+      }
+    },
+    [currentProgress],
+  );
+
+  // ── onSubmit (from QuizQuestion) ──────────────────────────────────────────
+
+  const handleQuestionSubmit = useCallback(
+    async (
+      selectedOption: string,
+      confidenceLevel: 'guessed' | 'unsure' | 'knew',
+      timeSpentMs: number,
+      answerChanges: number,
+    ) => {
+      if (!question) return;
+
+      const isCorrect = selectedOption === question.correctOption;
+
+      // Update streak refs
+      if (isCorrect) {
+        consecutiveCorrectRef.current += 1;
+        lastWasTransferRef.current = question.isTransferQuestion;
+      } else {
+        consecutiveCorrectRef.current = 0;
+        lastWasTransferRef.current = false;
+      }
+
+      // Classify misconception if wrong
+      let misconceptionId: string | null = null;
+      let misconceptionLabel: string | null = null;
+      let misconceptionLabel_bm: string | null = null;
+
+      if (!isCorrect) {
+        const classified = await classifyMisconception(question, selectedOption);
+        misconceptionId = classified.misconceptionId;
+        misconceptionLabel = classified.label;
+        misconceptionLabel_bm = classified.label_bm;
+      }
+
+      setAnswerState({
+        selectedOption,
+        isCorrect,
+        misconceptionId,
+        misconceptionLabel,
+        misconceptionLabel_bm,
+        confidenceLevel,
+        timeSpentMs,
+        answerChanges,
+      });
+
+      // Persist to Firestore
+      const payload: AnswerPayload = {
+        studentId: STUDENT_ID,
+        classId: CLASS_ID,
+        topic: currentProgress.currentTopic,
+        isCorrect,
+        isTransferQuestion: question.isTransferQuestion,
+        isResetQuestion: question.isResetQuestion,
+        confidenceLevel,
+        misconceptionId,
+        misconceptionLabel,
+        misconceptionLabel_bm,
+        timeSpentMs,
+        answerChanges,
+      };
+
+      try {
+        const updated = await updateStudentProgress(payload);
+        setStudentProgress(updated);
+      } catch (err) {
+        console.error('[student] updateStudentProgress error', err);
+      }
+
+      setPhase('feedback');
+    },
+    [question, currentProgress, classifyMisconception],
+  );
+
+  // ── onNext (from FeedbackCard) ────────────────────────────────────────────
+
+  const handleNext = useCallback(() => {
+    setPhase('question');
+    setAnswerState(null);
+    fetchQuestion();
+  }, [fetchQuestion]);
+
+  // ── Firestore realtime subscription ──────────────────────────────────────
+
+  useEffect(() => {
+    let unsubscribe: (() => void) | null = null;
+
+    subscribeStudentProgress(STUDENT_ID, (progress) => {
+      setStudentProgress(progress);
+    }).then((unsub) => {
+      unsubscribe = unsub;
+    });
+
+    return () => {
+      unsubscribe?.();
+    };
+  }, []);
+
+  // ── Initial question load ────────────────────────────────────────────────
+
+  useEffect(() => {
+    fetchQuestion();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Render
+  // ─────────────────────────────────────────────────────────────────────────
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-violet-50/20">
+      {/* ── Page header ── */}
+      <header className="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-slate-100 shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center text-white font-bold text-sm select-none">
+              M
+            </div>
+            <div>
+              <span className="font-bold text-slate-800 text-sm">
+                Mosaic Classroom
+              </span>
+              <span className="hidden sm:inline text-slate-400 text-xs ml-2">
+                Student View
+              </span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+            <span className="hidden sm:inline">
+              {language === 'bm'
+                ? `Pelajar: ${STUDENT_ID}`
+                : `Student: ${STUDENT_ID}`}
+            </span>
+          </div>
+        </div>
+      </header>
+
+      {/* ── Main layout ── */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 lg:py-8">
+        <div className="flex flex-col lg:flex-row gap-6 lg:gap-8">
+
+          {/* ══════════════════════════════════════════════════
+              SECTION 1 — Active Mission (60%)
+          ══════════════════════════════════════════════════ */}
+          <section className="flex-1 lg:w-[60%] min-w-0 space-y-5">
+
+            {/* Mission header card */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm px-5 py-4 space-y-3">
+              {/* Mission label */}
+              <div className="flex items-center gap-2 flex-wrap">
+                <span
+                  className={cn(
+                    'px-2.5 py-0.5 rounded-full text-xs font-bold uppercase tracking-wide',
+                    isBlue
+                      ? 'bg-blue-100 text-blue-700'
+                      : 'bg-violet-100 text-violet-700',
+                  )}
+                >
+                  {isBlue
+                    ? language === 'bm'
+                      ? 'Tier Biru'
+                      : 'Blue Tier'
+                    : language === 'bm'
+                    ? 'Aktif'
+                    : 'Active'}
+                </span>
+                <h1 className="text-sm font-semibold text-slate-700">
+                  {missionLabel}
+                </h1>
+              </div>
+
+              {/* Progress bar */}
+              <MissionProgressBar
+                current={Math.min(missionIndex + 1, TOTAL_MISSIONS)}
+                total={TOTAL_MISSIONS}
+                language={language}
+              />
+            </div>
+
+            {/* Error state */}
+            {questionError && (
+              <ErrorBanner
+                message={questionError}
+                onRetry={() => fetchQuestion()}
+              />
+            )}
+
+            {/* Question / Feedback area */}
+            <AnimatePresence mode="wait">
+              {phase === 'question' ? (
+                <motion.div
+                  key="question"
+                  initial={{ opacity: 0, y: 16 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -12 }}
+                  transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+                >
+                  {question || questionLoading ? (
+                    <QuizQuestion
+                      question={
+                        question ?? {
+                          questionId: 'loading',
+                          questionText: '',
+                          options: { A: '', B: '', C: '', D: '' },
+                          correctOption: 'A',
+                          isTransferQuestion: false,
+                          isResetQuestion: false,
+                        }
+                      }
+                      onSubmit={handleQuestionSubmit}
+                      language={language}
+                      isLoading={questionLoading}
+                    />
+                  ) : null}
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="feedback"
+                  initial={{ opacity: 0, y: 16 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -12 }}
+                  transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+                >
+                  {answerState && question && (
+                    <FeedbackCard
+                      isCorrect={answerState.isCorrect}
+                      misconceptionId={answerState.misconceptionId}
+                      misconceptionLabel={answerState.misconceptionLabel}
+                      misconceptionLabel_bm={answerState.misconceptionLabel_bm}
+                      isTransferQuestion={question.isTransferQuestion}
+                      isResetQuestion={question.isResetQuestion}
+                      confidenceLevel={answerState.confidenceLevel}
+                      language={language}
+                      onNext={handleNext}
+                    />
+                  )}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </section>
+
+          {/* ══════════════════════════════════════════════════
+              SECTION 2 — Mastery Map (40%)
+          ══════════════════════════════════════════════════ */}
+          <aside className="lg:w-[40%] lg:max-w-sm flex-shrink-0">
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm px-5 py-5 lg:sticky lg:top-24">
+              <MasteryMapPanel
+                progress={studentProgress}
+                language={language}
+                onLanguageToggle={() =>
+                  setLanguage((l) => (l === 'en' ? 'bm' : 'en'))
+                }
+              />
+            </div>
+          </aside>
+        </div>
+      </main>
+    </div>
+  );
+}
