@@ -240,7 +240,7 @@ function TopicMasteryCard({
       {/* Misconception hint */}
       {(tier === 'red' || tier === 'yellow') && misconceptionText && (
         <p className="text-[11px] leading-snug opacity-80 italic line-clamp-2">
-          "{misconceptionText}"
+          &quot;{misconceptionText}&quot;
         </p>
       )}
 
@@ -829,14 +829,15 @@ export default function StudentPage() {
       unsubscribe = onSnapshot(q, (snapshot) => {
         if (cancelled) return;
 
-        // Find the most recent active pulse
-        let latest: PulseDoc | null = null;
-        snapshot.forEach((doc) => {
+        // Find the most recent active pulse. Built via reduce rather than a
+        // `let` mutated inside forEach's callback — TS's control-flow
+        // analysis narrows a captured `let` reassigned inside a nested
+        // closure down to `never` once read back outside it, which reduce's
+        // self-contained accumulator avoids entirely.
+        const latest = snapshot.docs.reduce<PulseDoc | null>((acc, doc) => {
           const data = doc.data() as PulseDoc;
-          if (!latest || data.createdAt > latest.createdAt) {
-            latest = data;
-          }
-        });
+          return !acc || data.createdAt > acc.createdAt ? data : acc;
+        }, null);
 
         if (latest && (!activePulse || latest.pulseId !== activePulse.pulseId)) {
           setActivePulse(latest);

@@ -391,7 +391,8 @@ export default function TeacherDashboard() {
   const [selectedStudent, setSelectedStudent] = useState<StudentForPanel | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [interventionGroupsOpen, setInterventionGroupsOpen] = useState(false);
-  const [sortBy, setSortBy] = useState<'difficulty' | 'topic'>('difficulty');
+  // Sorting is now handled inside ClassGapMap itself (its own priority/name
+  // toggle) — this page no longer needs a duplicate sort-mode of its own.
   const [kioskSubmissions, setKioskSubmissions] = useState<KioskSubmission[]>([]);
   const [loading, setLoading] = useState(true);
 

@@ -165,7 +165,11 @@ interface StudentRow {
 function buildStudentRows(
   docs: StudentProgress[],
   topics: string[],
-  language: 'en' | 'bm',
+  // Not used yet — activeMisconceptions doesn't carry bilingual labels, so
+  // the dominant-misconception label below falls back to the raw id (see
+  // comment further down). Kept as a real param so the caller doesn't need
+  // to change once bilingual labels are wired in.
+  _language: 'en' | 'bm',
 ): StudentRow[] {
   // Group by studentUid
   const byStudent = new Map<string, StudentProgress[]>();

@@ -222,7 +222,7 @@ function MisconceptionBox({
         {thinkingText}
       </p>
       <p className="text-sm font-medium text-rose-800 leading-snug">
-        "{label}"
+        &quot;{label}&quot;
       </p>
     </motion.div>
   );

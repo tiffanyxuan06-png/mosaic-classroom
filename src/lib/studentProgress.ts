@@ -1,18 +1,13 @@
-import { db } from '@/lib/firebase';
-import {
-  doc,
-  getDoc,
-  setDoc,
-  serverTimestamp,
-  onSnapshot,
-  type Unsubscribe,
-} from 'firebase/firestore';
+import type { Unsubscribe } from 'firebase/firestore';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // NOTE: This module uses the Firebase CLIENT SDK (not Admin SDK) so it can be
 // imported safely in 'use client' components that need Firestore realtime
-// listeners.  The `db` from @/lib/firebase is the Admin SDK — so this file
-// uses a separate client-SDK initialisation.
+// listeners. The `db` from @/lib/firebase is the Admin SDK, so every function
+// below dynamically imports 'firebase/app' / 'firebase/firestore' and builds
+// its own client instance instead of a top-level import — the previous
+// top-level `db`/`doc`/`getDoc`/`setDoc`/`serverTimestamp`/`onSnapshot`
+// imports were leftover from before that pattern and were never used.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type MasteryTier = 'red' | 'yellow' | 'green' | 'blue';
@@ -316,7 +311,10 @@ export function getNextQuestionParams(
   lastWasCorrect: boolean,
   lastWasTransfer: boolean,
   consecutiveCorrect: number,
-  recentQuestions: string[],
+  // Not used yet — intended for repeat-question avoidance, not implemented.
+  // Kept as a real param since both callers already thread a live ref
+  // through it, ready for whenever that logic is added.
+  _recentQuestions: string[],
 ): NextQuestionParams {
   const topicProgress = progress.topics[progress.currentTopic];
   const tier = topicProgress?.tier ?? 'red';
