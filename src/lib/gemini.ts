@@ -15,7 +15,7 @@ const google = createGoogleGenerativeAI({
   apiKey: process.env.GEMINI_API_KEY ?? '',
 });
 
-export const DEFAULT_MODEL = 'gemini-1.5-flash';
+export const DEFAULT_MODEL = 'gemini-3.7-flash';
 export const MAX_TOKENS = 2000;
 
 /** Returned instead of throwing so callers can always parse a response. */
