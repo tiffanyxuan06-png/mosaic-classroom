@@ -41,6 +41,10 @@ export async function signOutUser(): Promise<void> {
 export function onAuthChange(
   callback: (user: User | null) => void
 ): () => void {
+  if (!auth || typeof auth.onAuthStateChanged !== "function") {
+    callback(null);
+    return () => {};
+  }
   return onAuthStateChanged(auth, callback);
 }
 
