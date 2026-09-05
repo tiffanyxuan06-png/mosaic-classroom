@@ -71,25 +71,25 @@ function SkeletonLoader() {
 
 // ────────────────────────────────────────────────────────────────────────────
 // Sub-component: TTS button
+// Spec interface: { text: string, language: 'en'|'bm' }
 // ────────────────────────────────────────────────────────────────────────────
 
 interface TtsButtonProps {
   text: string;
-  lang: string;
-  disabled: boolean;
+  language: 'en' | 'bm';
 }
 
-function TtsButton({ text, lang, disabled }: TtsButtonProps) {
+function TtsButton({ text, language }: TtsButtonProps) {
   const [speaking, setSpeaking] = useState(false);
 
-  function handleSpeak() {
+  function speak() {
     if (!('speechSynthesis' in window)) return;
 
     window.speechSynthesis.cancel();
 
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = lang;
-    utterance.rate = 0.9;
+    utterance.lang = language === 'bm' ? 'ms-MY' : 'en-US';
+    utterance.rate = 0.85;
 
     utterance.onstart = () => setSpeaking(true);
     utterance.onend = () => setSpeaking(false);
@@ -102,8 +102,7 @@ function TtsButton({ text, lang, disabled }: TtsButtonProps) {
     <button
       type="button"
       id="tts-button"
-      onClick={handleSpeak}
-      disabled={disabled}
+      onClick={speak}
       aria-label={speaking ? 'Reading question aloud…' : 'Read question aloud'}
       title={speaking ? 'Reading…' : 'Read aloud'}
       className={cn(
@@ -113,7 +112,6 @@ function TtsButton({ text, lang, disabled }: TtsButtonProps) {
         speaking
           ? 'border-blue-400 bg-blue-50 text-blue-600 shadow-inner animate-pulse'
           : 'border-slate-300 bg-white text-slate-500 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-600',
-        disabled && 'opacity-40 cursor-not-allowed',
       )}
     >
       {/* Speaker SVG — drawn inline so no icon-library needed */}
@@ -297,7 +295,6 @@ export default function QuizQuestion({
   isLoading,
 }: QuizQuestionProps) {
   const t = LABELS[language];
-  const ttsLang = language === 'bm' ? 'ms-MY' : 'en-US';
 
   // ── State ─────────────────────────────────────────────────────────────────
   const [selectedOption, setSelectedOption] = useState<OptionKey | null>(null);
@@ -402,8 +399,7 @@ export default function QuizQuestion({
                 </p>
                 <TtsButton
                   text={question.questionText}
-                  lang={ttsLang}
-                  disabled={isLoading || submitting}
+                  language={language}
                 />
               </div>
 
