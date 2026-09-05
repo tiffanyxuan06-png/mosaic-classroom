@@ -1,17 +1,26 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Menu, X } from 'lucide-react';
 
 import { supabase } from '@/lib/supabase-client';
 import { useUserRole } from '@/lib/auth';
 import { useLanguage } from '@/lib/LanguageContext';
+import { useClassContext } from '@/lib/useClassContext';
+import {
+  REPEAT_ALERT_THRESHOLD,
+  buildPeerTutorPairs,
+  clusterByMisconception,
+  findRepeatAlerts,
+  studentName as resolveStudentName,
+} from '@/lib/classInsights';
 import type { StudentProgress as HelpersStudentProgress } from '@/lib/helpers';
 import type { StudentTier as MasteryTier } from '@/lib/helpers';
 
 import ActionCard from '@/components/ActionCard';
 import ClassGapMap from '@/components/ClassGapMap';
+import ConnectionStatus from '@/components/ConnectionStatus';
 import PaperScanner from '@/components/PaperScanner';
 import { generateCapsuleHTML, type CapsuleResponse } from '@/lib/capsuleHtml';
 
@@ -458,8 +467,6 @@ export default function TeacherDashboard() {
   const [studentProgress, setStudentProgress] = useState<Map<string, HelpersStudentProgress>>(
     new Map(),
   );
-  /** student uid → display name, loaded from `profiles` for this class. */
-  const [studentNames, setStudentNames] = useState<Record<string, string>>({});
 
   // UI state
   const [selectedStudent, setSelectedStudent] = useState<StudentForPanel | null>(null);
@@ -486,6 +493,16 @@ export default function TeacherDashboard() {
 
   // Demo: using a hardcoded classId until class selection/routing exists.
   const CLASS_ID = 'class_demo_01';
+
+  // Student names + misconception catalogue, for every view that has to show
+  // a human something instead of a uuid or a slug.
+  const { context: classContext } = useClassContext(CLASS_ID);
+
+  // Grouping mode for the intervention section: by score tier, or by the
+  // shared misconception that actually explains the gap.
+  const [groupingMode, setGroupingMode] = useState<'misconception' | 'tier'>('misconception');
+  const [alertsDismissed, setAlertsDismissed] = useState(false);
+  const [peerTutoringOpen, setPeerTutoringOpen] = useState(false);
 
   const handlePushPulse = useCallback(async () => {
     if (pulseLoading) return;
@@ -697,39 +714,6 @@ export default function TeacherDashboard() {
   }, []);
 
   // ──────────────────────────────────────────────────────────────────────────
-  // Load the class roster (student names) so the gap map, intervention
-  // groups and detail panel can show names instead of raw uids.
-  // ──────────────────────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (!CLASS_ID) return;
-
-    let cancelled = false;
-
-    supabase
-      .from('profiles')
-      .select('id, name')
-      .eq('class_id', CLASS_ID)
-      .eq('role', 'student')
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error) {
-          console.error('[teacher] Error loading student names:', error);
-          return;
-        }
-        const names: Record<string, string> = {};
-        for (const row of data ?? []) {
-          if (row.id && row.name) names[row.id as string] = row.name as string;
-        }
-        setStudentNames(names);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // ──────────────────────────────────────────────────────────────────────────
   // Group progress rows by student uid (one entry per student, all topics)
   // ──────────────────────────────────────────────────────────────────────────
 
@@ -742,6 +726,40 @@ export default function TeacherDashboard() {
     });
     return map;
   }, [studentProgress]);
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Misconception-typology views: shared-error clusters for small-group work,
+  // repeat alerts for same-lesson triage, and peer-tutoring pairs.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  const progressRows = useMemo(
+    () => Array.from(studentProgress.values()),
+    [studentProgress],
+  );
+
+  const misconceptionClusters = useMemo(
+    () => clusterByMisconception(progressRows, classContext, language),
+    [progressRows, classContext, language],
+  );
+
+  const repeatAlerts = useMemo(
+    () => findRepeatAlerts(progressRows, classContext, language),
+    [progressRows, classContext, language],
+  );
+
+  const peerTutorPairs = useMemo(
+    () => buildPeerTutorPairs(progressRows, classContext, language),
+    [progressRows, classContext, language],
+  );
+
+  // A dismissal only silences the alerts the teacher actually saw — if another
+  // student trips the threshold mid-lesson, the banner comes back.
+  const dismissedCountRef = useRef(0);
+  useEffect(() => {
+    if (repeatAlerts.length > dismissedCountRef.current) {
+      setAlertsDismissed(false);
+    }
+  }, [repeatAlerts.length]);
 
   // ──────────────────────────────────────────────────────────────────────────
   // Group students by intervention tier
@@ -797,27 +815,27 @@ export default function TeacherDashboard() {
         if (avgScore < 90) {
           groups.green.students.push({
             uid: studentUid,
-            name: studentNames[studentUid] ?? studentUid,
+            name: resolveStudentName(studentUid, classContext),
             masteryScore: Math.round(avgScore),
           });
         } else {
           groups.blue.students.push({
             uid: studentUid,
-            name: studentNames[studentUid] ?? studentUid,
+            name: resolveStudentName(studentUid, classContext),
             masteryScore: Math.round(avgScore),
           });
         }
       } else {
         groups[worstTier].students.push({
           uid: studentUid,
-          name: studentNames[studentUid] ?? studentUid,
+          name: resolveStudentName(studentUid, classContext),
           masteryScore: 50, // placeholder
         });
       }
     });
 
     return [groups.red, groups.yellow, groups.green, groups.blue];
-  }, [progressByStudent, studentNames]);
+  }, [progressByStudent, classContext]);
 
   // ──────────────────────────────────────────────────────────────────────────
   // Handler: Toggle kiosk mode
@@ -907,7 +925,9 @@ export default function TeacherDashboard() {
 
       setSelectedStudent({
         uid: studentUid,
-        name: (profileRow?.name as string | undefined) || studentNames[studentUid] || 'Unknown',
+        name:
+          (profileRow?.name as string | undefined) ||
+          resolveStudentName(studentUid, classContext),
         email: (profileRow?.email as string | undefined) || '',
         progressByTopic: progressList,
       });
@@ -1008,6 +1028,8 @@ export default function TeacherDashboard() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
+      <ConnectionStatus language={language} />
+
       {/* Header */}
       <header className="border-b border-slate-200 bg-white shadow-sm">
         <div className="mx-auto max-w-7xl px-4 py-4 sm:px-6 lg:px-8">
@@ -1116,6 +1138,74 @@ export default function TeacherDashboard() {
               </section>
             )}
 
+            {/* 0. Repeat-misconception alerts — same-lesson triage */}
+            <AnimatePresence>
+              {repeatAlerts.length > 0 && !alertsDismissed && (
+                <motion.section
+                  initial={{ opacity: 0, y: -12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -12 }}
+                  className="rounded-2xl border-2 border-red-200 bg-red-50 overflow-hidden"
+                >
+                  <div className="flex items-center justify-between px-5 py-3 border-b border-red-100">
+                    <div className="flex items-center gap-2.5">
+                      <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
+                      <h2 className="text-sm font-bold text-red-900">
+                        {language === 'en'
+                          ? `Needs intervention now — repeated ${REPEAT_ALERT_THRESHOLD}+ times`
+                          : `Perlu campur tangan sekarang — berulang ${REPEAT_ALERT_THRESHOLD}+ kali`}
+                      </h2>
+                      <span className="text-xs font-mono text-red-500">
+                        {repeatAlerts.length}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => {
+                        dismissedCountRef.current = repeatAlerts.length;
+                        setAlertsDismissed(true);
+                      }}
+                      className="text-xs font-medium text-red-400 hover:text-red-700 transition-colors"
+                    >
+                      {language === 'en' ? 'Dismiss' : 'Tolak'}
+                    </button>
+                  </div>
+
+                  <ul className="divide-y divide-red-100">
+                    {repeatAlerts.slice(0, 5).map((alert) => (
+                      <li
+                        key={`${alert.studentUid}-${alert.topic}-${alert.misconceptionId}`}
+                        className="flex items-center justify-between gap-3 px-5 py-2.5"
+                      >
+                        <button
+                          onClick={() => handleSelectStudent(alert.studentUid)}
+                          className="flex-1 min-w-0 text-left group"
+                        >
+                          <p className="text-sm font-semibold text-red-900 group-hover:underline truncate">
+                            {alert.studentName}
+                          </p>
+                          <p className="text-xs text-red-700 truncate">
+                            {alert.label}
+                            <span className="text-red-400"> · {alert.topic}</span>
+                          </p>
+                        </button>
+                        <span className="flex-shrink-0 rounded-full bg-red-600 px-2 py-0.5 text-xs font-bold text-white">
+                          {alert.occurrenceCount}×
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+
+                  {repeatAlerts.length > 5 && (
+                    <p className="px-5 py-2 text-xs text-red-500">
+                      {language === 'en'
+                        ? `+${repeatAlerts.length - 5} more`
+                        : `+${repeatAlerts.length - 5} lagi`}
+                    </p>
+                  )}
+                </motion.section>
+              )}
+            </AnimatePresence>
+
             {/* 1. ActionCard */}
             <section>
               <ActionCard
@@ -1139,7 +1229,6 @@ export default function TeacherDashboard() {
                   classId={CLASS_ID}
                   topics={classData.topics || ['fractions', 'decimals', 'percentages']}
                   language={language}
-                  studentNames={studentNames}
                 />
               </div>
             </section>
@@ -1169,7 +1258,108 @@ export default function TeacherDashboard() {
                       exit={{ opacity: 0, height: 0 }}
                       className="space-y-6 p-6"
                     >
-                      {interventionGroups.map((group) => (
+                      {/* Grouping mode: shared error pattern vs score tier */}
+                      <div
+                        className="inline-flex rounded-lg bg-slate-100 p-0.5"
+                        role="radiogroup"
+                        aria-label="Grouping mode"
+                      >
+                        {(
+                          [
+                            {
+                              mode: 'misconception' as const,
+                              label: language === 'en' ? 'By misconception' : 'Ikut salah faham',
+                            },
+                            {
+                              mode: 'tier' as const,
+                              label: language === 'en' ? 'By mastery tier' : 'Ikut tahap',
+                            },
+                          ]
+                        ).map(({ mode, label }) => (
+                          <button
+                            key={mode}
+                            role="radio"
+                            aria-checked={groupingMode === mode}
+                            onClick={() => setGroupingMode(mode)}
+                            className={cn(
+                              'px-3 py-1.5 text-xs font-medium rounded-md transition-all',
+                              groupingMode === mode
+                                ? 'bg-white text-slate-900 shadow-sm'
+                                : 'text-slate-500 hover:text-slate-700',
+                            )}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Misconception clusters — ready-made small groups */}
+                      {groupingMode === 'misconception' && (
+                        misconceptionClusters.length === 0 ? (
+                          <p className="text-sm text-slate-400 italic">
+                            {language === 'en'
+                              ? 'No shared misconceptions detected yet.'
+                              : 'Tiada salah faham dikongsi dikesan lagi.'}
+                          </p>
+                        ) : (
+                          misconceptionClusters.map((cluster) => (
+                            <div key={cluster.misconceptionId}>
+                              <div className="mb-2 flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <h3 className="font-medium text-slate-900">
+                                    {cluster.shortLabel}
+                                  </h3>
+                                  <p className="text-xs text-slate-500 mt-0.5 capitalize">
+                                    {cluster.topics.join(', ')} · {cluster.severity}
+                                    {cluster.repeatAlertCount > 0 && (
+                                      <span className="text-red-600 font-semibold">
+                                        {' '}· {cluster.repeatAlertCount}{' '}
+                                        {language === 'en' ? 'need intervention' : 'perlu campur tangan'}
+                                      </span>
+                                    )}
+                                  </p>
+                                </div>
+                                <span className="flex-shrink-0 rounded-full bg-slate-800 px-3 py-1 text-sm font-semibold text-white">
+                                  {cluster.students.length}
+                                </span>
+                              </div>
+
+                              <div className="mb-3 flex flex-wrap gap-2">
+                                {cluster.students.map((student) => (
+                                  <button
+                                    key={student.uid}
+                                    onClick={() => handleSelectStudent(student.uid)}
+                                    className={cn(
+                                      'rounded-lg px-3 py-1 text-sm transition-colors',
+                                      student.repeatAlert
+                                        ? 'bg-red-100 text-red-800 hover:bg-red-200 font-medium'
+                                        : 'bg-slate-100 text-slate-700 hover:bg-slate-200',
+                                    )}
+                                  >
+                                    {student.name}
+                                    {student.repeatAlert && (
+                                      <span className="ml-1.5 text-xs font-bold">
+                                        {student.occurrenceCount}×
+                                      </span>
+                                    )}
+                                  </button>
+                                ))}
+                              </div>
+
+                              {cluster.remediationApproach && (
+                                <p className="mb-3 rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-900 leading-relaxed">
+                                  <span className="font-semibold">
+                                    {language === 'en' ? 'Remediation: ' : 'Pemulihan: '}
+                                  </span>
+                                  {cluster.remediationApproach}
+                                </p>
+                              )}
+                            </div>
+                          ))
+                        )
+                      )}
+
+                      {groupingMode === 'tier' && interventionGroups.map((group) => (
                         <div key={group.tier}>
                           <div className="mb-3 flex items-center justify-between">
                             <h3 className="font-medium text-slate-900">
@@ -1202,6 +1392,101 @@ export default function TeacherDashboard() {
                           )}
                         </div>
                       ))}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.div>
+            </section>
+
+            {/* 4. Peer tutoring — pair students who cleared a misconception
+                with students still stuck on the same one. */}
+            <section>
+              <motion.div
+                className="rounded-lg bg-white shadow-sm"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+              >
+                <button
+                  onClick={() => setPeerTutoringOpen(!peerTutoringOpen)}
+                  className="flex w-full items-center justify-between border-b border-slate-200 p-6 hover:bg-slate-50"
+                >
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-lg font-semibold text-slate-900">
+                      {language === 'en' ? 'Peer Tutoring Pairs' : 'Pasangan Tutor Rakan'}
+                    </h2>
+                    {peerTutorPairs.length > 0 && (
+                      <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-semibold text-emerald-800">
+                        {peerTutorPairs.length}
+                      </span>
+                    )}
+                  </div>
+                  <Menu
+                    className={cn(
+                      'h-5 w-5 text-slate-600 transition-transform',
+                      peerTutoringOpen && 'rotate-180',
+                    )}
+                  />
+                </button>
+
+                <AnimatePresence>
+                  {peerTutoringOpen && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="p-6"
+                    >
+                      {peerTutorPairs.length === 0 ? (
+                        <p className="text-sm text-slate-400 italic">
+                          {language === 'en'
+                            ? 'No pairings available yet — needs at least one student who has cleared a misconception another student still has.'
+                            : 'Tiada pasangan lagi — perlu sekurang-kurangnya seorang pelajar yang telah mengatasi salah faham yang masih dihadapi pelajar lain.'}
+                        </p>
+                      ) : (
+                        <ul className="space-y-3">
+                          {peerTutorPairs.map((pair) => (
+                            <li
+                              key={`${pair.tutor.uid}-${pair.learner.uid}-${pair.misconceptionId}`}
+                              className="rounded-xl border border-slate-200 px-4 py-3"
+                            >
+                              <div className="flex flex-wrap items-center gap-2 text-sm">
+                                <button
+                                  onClick={() => handleSelectStudent(pair.tutor.uid)}
+                                  className="font-semibold text-emerald-700 hover:underline"
+                                >
+                                  {pair.tutor.name}
+                                </button>
+                                <span className="text-slate-400">→</span>
+                                <button
+                                  onClick={() => handleSelectStudent(pair.learner.uid)}
+                                  className="font-semibold text-slate-900 hover:underline"
+                                >
+                                  {pair.learner.name}
+                                </button>
+                                {pair.learner.repeatAlert && (
+                                  <span className="rounded-full bg-red-600 px-2 py-0.5 text-xs font-bold text-white">
+                                    {pair.learner.occurrenceCount}×
+                                  </span>
+                                )}
+                              </div>
+                              <p className="mt-1 text-xs text-slate-500">
+                                {pair.label}
+                                <span className="text-slate-400"> · {pair.topic}</span>
+                                <span className="text-slate-400">
+                                  {' '}·{' '}
+                                  {pair.tutor.evidence === 'cleared'
+                                    ? language === 'en'
+                                      ? 'cleared this exact gap'
+                                      : 'telah atasi jurang ini'
+                                    : language === 'en'
+                                      ? 'strong on this topic'
+                                      : 'kukuh dalam topik ini'}
+                                </span>
+                              </p>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </motion.div>
                   )}
                 </AnimatePresence>

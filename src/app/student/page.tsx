@@ -8,12 +8,16 @@ import { useLanguage } from '@/lib/LanguageContext';
 import FeedbackCard from '@/components/FeedbackCard';
 import { supabase } from '@/lib/supabase-client';
 import {
+  applyAnswerLocally,
   getNextQuestionParams,
   type StudentProgress,
   type StudentTier,
   type ConfidenceLevel,
   type Answer,
 } from '@/lib/helpers';
+import { postWithOfflineFallback } from '@/lib/offlineQueue';
+import { cacheMisconceptionCatalogue, classifyOffline } from '@/lib/offlineClassifier';
+import ConnectionStatus from '@/components/ConnectionStatus';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -716,7 +720,27 @@ export default function StudentPage() {
           label_bm: labels.bm ?? data.reasoning,
         };
       } catch {
-        // Fall back to existing active misconception
+        // No network (or the classifier failed): match locally against the
+        // cached catalogue so the student still gets a targeted diagnosis.
+        const local = classifyOffline({
+          subject: SUBJECT,
+          topic: CURRENT_TOPIC,
+          questionText: q.questionText,
+          studentAnswer: q.options[selectedOption as keyof typeof q.options],
+        });
+
+        if (local) {
+          const labels = await fetchMisconceptionLabels(local.misconceptionId).catch(
+            () => ({ en: null, bm: null }),
+          );
+          return {
+            misconceptionId: local.misconceptionId,
+            label: labels.en ?? local.reasoning,
+            label_bm: labels.bm ?? local.reasoning,
+          };
+        }
+
+        // Last resort: keep working the misconception they already had.
         const active = studentProgressRef.current.activeMisconceptions.find(
           (m) => !m.isCleared,
         );
@@ -780,25 +804,30 @@ export default function StudentPage() {
 
       // Progress read/write goes through the shared service-role route (this
       // demo student session has no real Supabase Auth session for RLS to
-      // match against).
+      // match against). Offline, the write is queued locally and replayed on
+      // reconnect, and the tier is advanced optimistically so the student can
+      // keep working through a wifi drop.
       try {
-        const res = await fetch('/api/progress', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            studentId: STUDENT_ID,
-            classId: CLASS_ID,
-            topic: CURRENT_TOPIC,
-            isCorrect,
-            isTransferQuestion: question.isTransferQuestion,
-            misconceptionId,
-            confidenceLevel,
-          }),
+        const res = await postWithOfflineFallback('/api/progress', {
+          studentId: STUDENT_ID,
+          classId: CLASS_ID,
+          topic: CURRENT_TOPIC,
+          isCorrect,
+          isTransferQuestion: question.isTransferQuestion,
+          misconceptionId,
+          confidenceLevel,
         });
 
-        if (res.ok) {
+        if (res?.ok) {
           const data: { progress: StudentProgress } = await res.json();
           setStudentProgress(data.progress);
+        } else {
+          setStudentProgress((prev) =>
+            applyAnswerLocally(
+              prev ?? defaultProgress(STUDENT_ID, CLASS_ID, CURRENT_TOPIC),
+              { isCorrect, misconceptionId },
+            ),
+          );
         }
       } catch (err) {
         console.error('[student] updateStudentProgress error', err);
@@ -853,6 +882,8 @@ export default function StudentPage() {
 
   useEffect(() => {
     fetchQuestion();
+    // Warm the offline catalogue while we still have a connection.
+    void cacheMisconceptionCatalogue();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -917,6 +948,8 @@ export default function StudentPage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-violet-50/20">
+      <ConnectionStatus language={language} />
+
       {/* ── Pulse toast ── */}
       <PulseToast visible={showPulseToast} language={language} />
 

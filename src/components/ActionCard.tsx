@@ -32,9 +32,17 @@ interface MisconceptionSummary {
   persistenceScore: number;
 }
 
+interface MicroLesson {
+  durationMinutes: number;
+  steps: { minutes: number; instruction: string }[];
+  addressesMisconception: string;
+  checkForUnderstanding: string;
+}
+
 interface GeneratedActionCard {
   urgentSummary: string;
   suggestedActivity: string | null;
+  microLesson?: MicroLesson | null;
   pushPulseCheck: boolean;
   affectedStudentCount: number;
 }
@@ -42,6 +50,7 @@ interface GeneratedActionCard {
 const ALL_CLEAR_CARD: GeneratedActionCard = {
   urgentSummary: 'Class looks good — no critical misconceptions detected.',
   suggestedActivity: null,
+  microLesson: null,
   pushPulseCheck: false,
   affectedStudentCount: 0,
 };
@@ -273,6 +282,41 @@ export default function ActionCard({
             <p className="mt-4 max-w-4xl text-base font-medium leading-relaxed text-slate-700">
               {card.suggestedActivity}
             </p>
+          )}
+
+          {/* What to teach next — a runnable micro-lesson, not just a chart */}
+          {card.microLesson && (
+            <div className="mt-5 max-w-4xl rounded-xl border border-slate-200 bg-white p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-bold text-slate-900">
+                  Micro-lesson — what to teach next
+                </h3>
+                <span className="rounded-full bg-slate-900 px-2.5 py-0.5 text-xs font-semibold text-white">
+                  {card.microLesson.durationMinutes} min
+                </span>
+              </div>
+
+              <p className="mt-2 text-xs text-slate-500">
+                <span className="font-semibold text-slate-700">Targets: </span>
+                {card.microLesson.addressesMisconception}
+              </p>
+
+              <ol className="mt-3 space-y-2">
+                {card.microLesson.steps.map((step, i) => (
+                  <li key={i} className="flex gap-3 text-sm text-slate-700">
+                    <span className="mt-0.5 flex-shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-xs font-mono font-semibold text-slate-600">
+                      {step.minutes}m
+                    </span>
+                    <span className="leading-snug">{step.instruction}</span>
+                  </li>
+                ))}
+              </ol>
+
+              <p className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-xs leading-relaxed text-emerald-900">
+                <span className="font-semibold">Check it landed: </span>
+                {card.microLesson.checkForUnderstanding}
+              </p>
+            </div>
           )}
 
           <div className="mt-6 flex flex-wrap items-center justify-between gap-3">

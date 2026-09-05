@@ -6,12 +6,16 @@ import { supabase } from "@/lib/supabase-client";
 import QuizQuestion, { type QuizQuestionData } from "@/components/QuizQuestion";
 import FeedbackCard from "@/components/FeedbackCard";
 import {
+  applyAnswerLocally,
   getNextQuestionParams,
   type Answer,
   type ConfidenceLevel,
   type StudentProgress,
   type StudentTier,
 } from "@/lib/helpers";
+import { postWithOfflineFallback } from "@/lib/offlineQueue";
+import { cacheMisconceptionCatalogue, classifyOffline } from "@/lib/offlineClassifier";
+import ConnectionStatus from "@/components/ConnectionStatus";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -149,6 +153,8 @@ export default function KioskSessionPage({
     }
 
     loadClassAndRoster();
+    // Warm the offline catalogue while the kiosk still has a connection.
+    void cacheMisconceptionCatalogue();
     return () => {
       cancelled = true;
     };
@@ -256,6 +262,25 @@ export default function KioskSessionPage({
           label_bm: labels.bm ?? (data.reasoning as string),
         };
       } catch {
+        // Offline: match locally against the cached catalogue.
+        const local = classifyOffline({
+          subject,
+          topic: currentProgress.topic,
+          questionText: q.questionText,
+          studentAnswer: q.options[selectedOption as keyof typeof q.options],
+        });
+
+        if (local) {
+          const labels = await fetchMisconceptionLabels(local.misconceptionId).catch(
+            () => ({ en: null, bm: null }),
+          );
+          return {
+            misconceptionId: local.misconceptionId,
+            label: labels.en ?? local.reasoning,
+            label_bm: labels.bm ?? local.reasoning,
+          };
+        }
+
         const active = currentProgress.activeMisconceptions.find((m) => !m.isCleared);
         return {
           misconceptionId: active?.misconceptionId ?? "unknown",
@@ -320,48 +345,49 @@ export default function KioskSessionPage({
         },
       ];
 
-      // Raw kiosk answer log — separate from the progress document
+      // Raw kiosk answer log — separate from the progress row. Queued offline
+      // so a wifi drop mid-session doesn't lose the evidence trail.
       try {
-        await fetch("/api/kiosk/answer", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            classId,
-            studentName: selectedStudent.name,
-            questionId: question.questionId,
-            questionText: question.questionText,
-            selectedOption,
-            correctOption: question.correctOption,
-            isCorrect,
-            confidenceLevel,
-            timeSpentMs,
-            answerChanges,
-            misconceptionId,
-            topic: progress.topic,
-          }),
+        await postWithOfflineFallback("/api/kiosk/answer", {
+          classId,
+          studentName: selectedStudent.name,
+          questionId: question.questionId,
+          questionText: question.questionText,
+          selectedOption,
+          correctOption: question.correctOption,
+          isCorrect,
+          confidenceLevel,
+          timeSpentMs,
+          answerChanges,
+          misconceptionId,
+          topic: progress.topic,
         });
       } catch (err) {
         console.error("[kiosk] answer log error", err);
       }
 
       try {
-        const res = await fetch("/api/progress", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            studentId,
-            classId,
-            topic: progress.topic,
-            isCorrect,
-            isTransferQuestion,
-            misconceptionId,
-            confidenceLevel,
-          }),
+        const res = await postWithOfflineFallback("/api/progress", {
+          studentId,
+          classId,
+          topic: progress.topic,
+          isCorrect,
+          isTransferQuestion,
+          misconceptionId,
+          confidenceLevel,
         });
 
-        if (res.ok) {
+        if (res?.ok) {
           const data: { progress: StudentProgress } = await res.json();
           setProgress(data.progress);
+        } else {
+          // Offline: advance the tier locally so the kiosk keeps working.
+          setProgress((prev) =>
+            applyAnswerLocally(prev ?? defaultProgress(studentId, classId, progress.topic), {
+              isCorrect,
+              misconceptionId,
+            }),
+          );
         }
       } catch (err) {
         console.error("[kiosk] updateStudentProgress error", err);
@@ -410,6 +436,7 @@ export default function KioskSessionPage({
   if (phase === "selection") {
     return (
       <div className="min-h-screen bg-muted/40 p-6">
+        <ConnectionStatus />
         <h1 className="mb-8 text-center text-5xl font-bold">Who are you?</h1>
 
         {rosterLoading ? (
@@ -440,6 +467,7 @@ export default function KioskSessionPage({
   if (phase === "quiz") {
     return (
       <div className="min-h-screen bg-muted/40 p-6">
+        <ConnectionStatus />
         <div className="mx-auto max-w-2xl space-y-4">
           <p className="text-center text-lg font-medium text-muted-foreground">
             {selectedStudent?.name} — Question{" "}

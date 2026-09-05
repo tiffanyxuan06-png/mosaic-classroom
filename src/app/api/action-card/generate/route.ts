@@ -20,9 +20,21 @@ interface ActionCardBody {
   topMisconceptions: MisconceptionSummary[];
 }
 
+interface MicroLesson {
+  /** Total minutes the plan is designed to take (10-15). */
+  durationMinutes: number;
+  /** Ordered steps a teacher can run straight off the card. */
+  steps: { minutes: number; instruction: string }[];
+  /** The specific wrong thinking to name and confront out loud. */
+  addressesMisconception: string;
+  /** One question that proves whether the fix landed. */
+  checkForUnderstanding: string;
+}
+
 interface ActionCard {
   urgentSummary: string;
   suggestedActivity: string | null;
+  microLesson: MicroLesson | null;
   pushPulseCheck: boolean;
   affectedStudentCount: number;
 }
@@ -88,12 +100,32 @@ function isValidBody(body: unknown): body is ActionCardBody {
   );
 }
 
+function isValidMicroLesson(lesson: unknown): lesson is MicroLesson {
+  if (!lesson || typeof lesson !== 'object') return false;
+  const l = lesson as Record<string, unknown>;
+  return (
+    typeof l.durationMinutes === 'number' &&
+    typeof l.addressesMisconception === 'string' &&
+    typeof l.checkForUnderstanding === 'string' &&
+    Array.isArray(l.steps) &&
+    l.steps.length > 0 &&
+    (l.steps as unknown[]).every((step) => {
+      if (!step || typeof step !== 'object') return false;
+      const s = step as Record<string, unknown>;
+      return typeof s.minutes === 'number' && typeof s.instruction === 'string';
+    })
+  );
+}
+
 function isValidActionCard(card: unknown): card is ActionCard {
   if (!card || typeof card !== 'object') return false;
   const c = card as Record<string, unknown>;
   return (
     typeof c.urgentSummary === 'string' &&
     (c.suggestedActivity === null || typeof c.suggestedActivity === 'string') &&
+    (c.microLesson === null ||
+      c.microLesson === undefined ||
+      isValidMicroLesson(c.microLesson)) &&
     typeof c.pushPulseCheck === 'boolean' &&
     typeof c.affectedStudentCount === 'number'
   );
@@ -137,8 +169,18 @@ ${topMisconceptionsJSON}
 
 Generate a teacher action card:
 1. One urgent sentence: what is the main problem right now
-2. A specific 5-10 minute classroom activity to address it (be concrete — name the activity type and what materials or approach to use)
-3. Whether to push a 3-question Pulse Check after (true/false)
+2. A one-line summary of the activity to run
+3. A concrete 10-15 minute micro-lesson plan broken into timed steps the
+   teacher can run straight off the card, targeting the TOP misconception
+   above. Name the wrong thinking explicitly so the teacher can confront it
+   out loud, and end with one question that proves whether the fix landed.
+4. Whether to push a 3-question Pulse Check after (true/false)
+
+Rules for the micro-lesson:
+- Steps must sum to durationMinutes, which must be between 10 and 15
+- 3 to 5 steps, each one concrete instruction (not "discuss the topic")
+- Target the specific error pattern, not the general topic
+- Name materials or board work where relevant
 
 Keep language simple — the teacher is mid-lesson. One decision, not a report.
 
@@ -146,6 +188,12 @@ Return ONLY valid JSON:
 {
   "urgentSummary": "...",
   "suggestedActivity": "...",
+  "microLesson": {
+    "durationMinutes": number,
+    "steps": [{ "minutes": number, "instruction": "..." }],
+    "addressesMisconception": "...",
+    "checkForUnderstanding": "..."
+  },
   "pushPulseCheck": true|false,
   "affectedStudentCount": number
 }`;
@@ -157,10 +205,38 @@ Return ONLY valid JSON:
 
 function buildFallbackCard(body: ActionCardBody): ActionCard {
   const topMisconception = body.topMisconceptions[0];
+  const gap = topMisconception?.misconceptionName ?? body.topic;
+
   return {
-    urgentSummary: `${totalAffected(body.topMisconceptions)} student(s) are struggling with "${topMisconception?.misconceptionName ?? body.topic}". Consider pausing for a quick class discussion.`,
+    urgentSummary: `${totalAffected(body.topMisconceptions)} student(s) are struggling with "${gap}". Consider pausing for a quick class discussion.`,
     suggestedActivity:
       'Ask students to work a similar problem individually on mini-whiteboards, then compare answers with a partner before class review.',
+    microLesson: {
+      durationMinutes: 12,
+      addressesMisconception: gap,
+      steps: [
+        {
+          minutes: 3,
+          instruction: `Put one worked example on the board and ask the class to spot where "${gap}" goes wrong — don't correct it yet.`,
+        },
+        {
+          minutes: 4,
+          instruction:
+            'Work the correct method beside it, saying each step aloud so the contrast with the wrong method is explicit.',
+        },
+        {
+          minutes: 3,
+          instruction:
+            'Students try one problem on mini-whiteboards; hold up answers so you can scan the room in one look.',
+        },
+        {
+          minutes: 2,
+          instruction:
+            'Pair a student who got it with one who did not, and have them explain their reasoning to each other.',
+        },
+      ],
+      checkForUnderstanding: `Give one problem designed to trigger "${gap}" — if they avoid the trap, it landed.`,
+    },
     pushPulseCheck: true,
     affectedStudentCount: totalAffected(body.topMisconceptions),
   };
@@ -192,6 +268,7 @@ export async function POST(request: NextRequest) {
         urgentSummary:
           'Class looks good — no critical misconceptions detected.',
         suggestedActivity: null,
+        microLesson: null,
         pushPulseCheck: false,
         affectedStudentCount: 0,
       };
